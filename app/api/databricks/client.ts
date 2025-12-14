@@ -1,92 +1,49 @@
 // app/api/databricks/client.ts
-import { getSQLiteClient } from '@/lib/sqlite-client';
-import axios from 'axios';
 
 export type DatabricksConfig = {
   apiUrl: string;
   accessToken: string;
   catalogName: string;
   schemaName: string;
-  tableName?: string;
   warehouseId: string;
+  sourceTable: string;
+  dimensionsTable: string;
+  salesforceTable: string;
 }
 
-export type TableInfo = {
-  name: string;
-  columns: {
-    name: string;
-    type: string;
-  }[];
-};
-
-export const getDatabricksConfig = (): DatabricksConfig => {
-  const config = localStorage.getItem('databricksConfig');
-  const fieldMapping = JSON.parse(localStorage.getItem('fieldMapping') || '{}');
-
-  let nameMappedField;
-  for (const key in fieldMapping) {
-    if(fieldMapping[key] === 'Name')
-      nameMappedField = key;
-  }
-
-  const res = config ? JSON.parse(config) : { 
-    apiUrl: "",
-    accessToken: "",
-    catalogName: "",
-    schemaName: "",
-    warehouseId: ""
-  };
-
-  return { ...res, nameMappedField };
-};
-
-export const fetchTables = async (catalogName?: string, schemaName?: string) => {
-  const config = getDatabricksConfig();
+export const getDatabricksConfig = (): DatabricksConfig | null => {
+  if (typeof window === 'undefined') return null;
   
-  const response = await axios.post('/api/databricks/tables', {
-    apiUrl: config.apiUrl,
-    accessToken: config.accessToken,
-    catalogName: catalogName || config.catalogName,
-    schemaName: schemaName || config.schemaName
-  });
-
-  return response.data.map(({ name, columns }: {name: string, columns: any[]}) => ({ 
-    name, 
-    columns 
-  }));
+  const config = localStorage.getItem('appConfig');
+  return config ? JSON.parse(config) : null;
 };
 
-export const fetchDatabricksData = async () => {
-  const client = await getSQLiteClient();
-  const config = getDatabricksConfig();
-  const fieldMapping = JSON.parse(localStorage.getItem('fieldMapping') || '{}');
-  const fields = Object.keys(fieldMapping);
-
+// Fetch data from Databricks table
+export async function fetchDatabricksData(
+  config: DatabricksConfig,
+  tablePath: string,
+  fields: string[] | Record<string, string>,
+  limit: number = 10000
+): Promise<any[]> {
   const response = await fetch('/api/databricks/accounts', {
     method: 'POST',
-    body: JSON.stringify({ 
-      ...config,
-      fields 
-    })
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      apiUrl: config.apiUrl,
+      accessToken: config.accessToken,
+      warehouseId: config.warehouseId,
+      tablePath,
+      fields,
+      limit,
+    }),
   });
 
   if (!response.ok) {
-    throw new Error(`HTTP error! status: ${response.status}`);
+    const error = await response.json();
+    throw new Error(error.error || 'Failed to fetch data from Databricks');
   }
-  
-  const data = await response.json();
 
-  // Очищаем старые данные перед загрузкой новых
-  await client.query(
-    "DELETE FROM accounts WHERE source = 'databricks'"
-  );
-
-  // Сохраняем новые данные в SQLite
-  await Promise.all(
-    data.map((account: any) => 
-      client.insertAccount(account, 'databricks', fieldMapping)
-    )
-  );
-
-  return data.length;
-};
+  return response.json();
+}
