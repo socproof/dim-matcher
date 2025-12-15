@@ -28,7 +28,6 @@ export const SALESFORCE_FIELDS = [
   'Name',
   'BillingStreet',
   'BillingCity',
-  'BillingState',
   'BillingPostalCode',
   'BillingCountry',
   'Phone',

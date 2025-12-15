@@ -6,7 +6,6 @@ export const ALIKE_MATCH_FIELDS = {
   'Phone': 25,
   'Website': 15,
   'Company_Registration_No__c': 100,
-  'BillingState': 25,
   'BillingCity': 25
 };
 

@@ -5,17 +5,16 @@ import { useEffect, useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { Progress } from '@/components/ui/progress';
 import { Badge } from '@/components/ui/badge';
-import { MAX_POSSIBLE_SCORE, MATCH_THRESHOLD } from '@/lib/matching-config';
-import { getSQLiteClient } from '@/lib/sqlite-client';
+import { getPostgresClient } from '@/lib/postgres-client';
 import { processSourceChunk, MatchedAccount } from '@/lib/find-matches-chunked';
-import { fetchDatabricksData } from '@/app/api/databricks/client';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { InfoIcon } from 'lucide-react';
 
 const CHUNK_SIZE = 10;
 
 export default function MatchingPage() {
-  const [status, setStatus] = useState<string>('Initializing database...');
+  const [status, setStatus] = useState<string>('Checking database...');
   const [currentChunkData, setCurrentChunkData] = useState<MatchedAccount[]>([]);
   const [processedStatus, setProcessedStatus] = useState<Map<string, 'merged' | 'added'>>(new Map());
   const [isLoading, setIsLoading] = useState(false);
@@ -38,18 +37,27 @@ export default function MatchingPage() {
   const [currentChunkIndex, setCurrentChunkIndex] = useState<number>(0);
   const [hasMoreChunks, setHasMoreChunks] = useState<boolean>(false);
   const [stats, setStats] = useState({ both: 0, dimOnly: 0, sfOnly: 0, new: 0 });
+  const [dataLoaded, setDataLoaded] = useState(false);
 
   const loadFieldMapping = useCallback(() => {
+    const defaults = getDefaultMapping();
     const storedMapping = localStorage.getItem('fieldMapping');
+
     if (storedMapping) {
       try {
-        return JSON.parse(storedMapping);
+        const parsed = JSON.parse(storedMapping);
+        // Merge with defaults to ensure all keys exist
+        return {
+          source: parsed.source || defaults.source,
+          dimensions: parsed.dimensions || defaults.dimensions,
+          salesforce: parsed.salesforce || defaults.salesforce
+        };
       } catch (e) {
         console.error("Failed to parse fieldMapping from localStorage", e);
-        return getDefaultMapping();
+        return defaults;
       }
     }
-    return getDefaultMapping();
+    return defaults;
   }, []);
 
   const getDefaultMapping = () => ({
@@ -83,68 +91,54 @@ export default function MatchingPage() {
     }
   });
 
-  // Инициализация БД
   useEffect(() => {
-    const initDbAndCheckData = async () => {
-      setStatus('Initializing database...');
+    const checkDatabase = async () => {
+      setStatus('Checking database connection...');
       try {
-        const client = await getSQLiteClient();
-        await client.createAccountsTable();
-        setIsDbReady(true);
-
+        const client = getPostgresClient();
         const counts = await client.getAccountCounts();
 
-        // Обновляем структуру counts для трех источников
-        const updatedCounts = {
-          source: counts.databricks || 0, // Временно используем databricks как source
-          dimensions: 0,
-          salesforce: counts.salesforce || 0,
-          total: counts.total || 0
-        };
+        setDbCounts(counts);
+        setIsDbReady(true);
 
-        // Получаем count для dimensions отдельно
-        const dimCountResult = await client.query<{ count: number }>(
-          "SELECT COUNT(*) as count FROM accounts WHERE source = 'dimensions'"
-        );
-        updatedCounts.dimensions = dimCountResult?.[0]?.count || 0;
+        console.log('[Matching] DB Counts:', counts);
 
-        // Получаем count для source отдельно
-        const sourceCountResult = await client.query<{ count: number }>(
-          "SELECT COUNT(*) as count FROM accounts WHERE source = 'source'"
-        );
-        updatedCounts.source = sourceCountResult?.[0]?.count || 0;
-
-        updatedCounts.total = updatedCounts.source + updatedCounts.dimensions + updatedCounts.salesforce;
-
-        setDbCounts(updatedCounts);
-
-        console.log('[Matching] DB Counts:', updatedCounts);
-
-        if (updatedCounts.total > 0) {
-          setStatus(`Found ${updatedCounts.source} Source, ${updatedCounts.dimensions} Dimensions, and ${updatedCounts.salesforce} Salesforce accounts. Ready to process.`);
-          setHasMoreChunks(updatedCounts.source > 0);
+        if (counts.total > 0) {
+          setDataLoaded(true);
+          setStatus(`Database ready. Found ${counts.source} Source, ${counts.dimensions} Dimensions, and ${counts.salesforce} Salesforce accounts.`);
+          setHasMoreChunks(counts.source > 0);
         } else {
-          setStatus('Database ready. Load accounts from sources to begin.');
+          setDataLoaded(false);
+          setStatus('Database is empty. Click "Load All Data" to populate from Databricks.');
           setHasMoreChunks(false);
         }
       } catch (error) {
-        setStatus(`Database initialization error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        setStatus(`Database connection error: ${error instanceof Error ? error.message : 'Unknown error'}`);
         setIsDbReady(false);
-        console.error('[Matching] Init error:', error);
+        console.error('[Matching] DB check error:', error);
       }
     };
 
-    initDbAndCheckData();
+    checkDatabase();
   }, []);
 
+  // Загрузка данных из всех трех источников
   const handleLoadAccounts = async () => {
     if (!isDbReady) {
       setStatus('Database is not ready yet. Please wait or refresh.');
       return;
     }
 
+    const confirmReload = confirm(
+      `This will delete all existing data (${dbCounts.total} records) and reload from Databricks. Continue?`
+    );
+
+    if (!confirmReload) {
+      return;
+    }
+
     setIsLoading(true);
-    setStatus('Loading accounts from all three sources...');
+    setStatus('Clearing existing data...');
     setCurrentChunkData([]);
     setProcessedStatus(new Map());
     setCurrentChunkIndex(0);
@@ -152,7 +146,7 @@ export default function MatchingPage() {
     setStats({ both: 0, dimOnly: 0, sfOnly: 0, new: 0 });
 
     try {
-      const client = await getSQLiteClient();
+      const client = getPostgresClient();
       await client.clearAccounts();
 
       const config = JSON.parse(localStorage.getItem('appConfig') || '{}');
@@ -173,18 +167,17 @@ export default function MatchingPage() {
 
       console.log('[LoadAccounts] Source data loaded:', sourceData.length);
 
-      for (const account of sourceData) {
-        await client.insertAccount(account, 'source', fieldMapping.source);
-      }
+      setStatus(`Saving ${sourceData.length} Source accounts to database...`);
+      await client.insertAccountBatch(sourceData, 'source', fieldMapping.source);
 
-      // Загружаем Dimensions чанками (206k записей)
+      // Загружаем Dimensions чанками
       setStatus('Loading Dimensions accounts (0/?)...');
       const dimensionsData = await loadTableInChunks(
         config.apiUrl,
         config.accessToken,
         config.warehouseId,
         config.dimensionsTable,
-        30000, // Уменьшаем чанк до 30k для безопасности
+        30000,
         (loaded) => {
           setStatus(`Loading Dimensions: ${loaded} records loaded...`);
         }
@@ -193,21 +186,16 @@ export default function MatchingPage() {
       console.log('[LoadAccounts] Dimensions data loaded:', dimensionsData.length);
 
       setStatus(`Saving ${dimensionsData.length} Dimensions accounts to database...`);
-      for (let i = 0; i < dimensionsData.length; i++) {
-        await client.insertAccount(dimensionsData[i], 'dimensions', fieldMapping.dimensions);
-        if (i % 1000 === 0) {
-          setStatus(`Saving Dimensions: ${i}/${dimensionsData.length}...`);
-        }
-      }
+      await client.insertAccountBatch(dimensionsData, 'dimensions', fieldMapping.dimensions);
 
-      // Загружаем Salesforce чанками (744k записей)
+      // Загружаем Salesforce чанками
       setStatus('Loading Salesforce accounts (0/?)...');
       const salesforceData = await loadTableInChunks(
         config.apiUrl,
         config.accessToken,
         config.warehouseId,
         config.salesforceTable,
-        30000, // Уменьшаем чанк до 30k для безопасности
+        30000,
         (loaded) => {
           setStatus(`Loading Salesforce: ${loaded} records loaded...`);
         }
@@ -216,12 +204,7 @@ export default function MatchingPage() {
       console.log('[LoadAccounts] Salesforce data loaded:', salesforceData.length);
 
       setStatus(`Saving ${salesforceData.length} Salesforce accounts to database...`);
-      for (let i = 0; i < salesforceData.length; i++) {
-        await client.insertAccount(salesforceData[i], 'salesforce', fieldMapping.salesforce);
-        if (i % 1000 === 0) {
-          setStatus(`Saving Salesforce: ${i}/${salesforceData.length}...`);
-        }
-      }
+      await client.insertAccountBatch(salesforceData, 'salesforce', fieldMapping.salesforce);
 
       const newCounts = {
         source: sourceData.length,
@@ -231,6 +214,7 @@ export default function MatchingPage() {
       };
 
       setDbCounts(newCounts);
+      setDataLoaded(true);
       setStatus(`Successfully loaded ${newCounts.source} Source, ${newCounts.dimensions} Dimensions, and ${newCounts.salesforce} Salesforce accounts.`);
       setHasMoreChunks(newCounts.source > 0);
 
@@ -242,6 +226,7 @@ export default function MatchingPage() {
     }
   };
 
+  // Вспомогательная функция для загрузки одной таблицы
   const loadTableData = async (
     apiUrl: string,
     accessToken: string,
@@ -269,13 +254,14 @@ export default function MatchingPage() {
     return await response.json();
   };
 
+  // Вспомогательная функция для загрузки большой таблицы чанками
   const loadTableInChunks = async (
     apiUrl: string,
     accessToken: string,
     warehouseId: string,
     tablePath: string,
     chunkSize: number,
-    onProgress?: (loaded: number, total: number) => void
+    onProgress?: (loaded: number) => void
   ): Promise<any[]> => {
     const allData: any[] = [];
     let offset = 0;
@@ -304,7 +290,6 @@ export default function MatchingPage() {
           const errorData = await response.json();
           console.error(`[loadTableInChunks] Failed to load chunk at offset ${offset}:`, errorData);
 
-          // Если ошибка связана с лимитом размера, уменьшаем chunkSize
           if (errorData.details?.message?.includes('Inline byte limit exceeded')) {
             console.log('[loadTableInChunks] Reducing chunk size due to byte limit');
             return loadTableInChunks(apiUrl, accessToken, warehouseId, tablePath, Math.floor(chunkSize / 2), onProgress);
@@ -326,15 +311,13 @@ export default function MatchingPage() {
         allData.push(...chunkData);
 
         if (onProgress) {
-          onProgress(allData.length, allData.length);
+          onProgress(allData.length);
         }
 
-        // Если получили меньше чем chunkSize, значит это последний чанк
         if (chunkData.length < chunkSize) {
           console.log(`[loadTableInChunks] ${tablePath} - Last chunk (${chunkData.length} < ${chunkSize}), stopping`);
           hasMore = false;
         } else {
-          // Увеличиваем offset для следующей итерации
           offset += chunkData.length;
           console.log(`[loadTableInChunks] ${tablePath} - Moving to next chunk, new offset: ${offset}`);
         }
@@ -349,7 +332,6 @@ export default function MatchingPage() {
     return allData;
   };
 
-
   // Обработка чанка
   const handleProcessChunk = async (startIndex: number) => {
     if (!isDbReady) {
@@ -357,7 +339,7 @@ export default function MatchingPage() {
       return;
     }
     if (dbCounts.source === 0) {
-      setStatus('No Source accounts loaded. Please Load Accounts first.');
+      setStatus('No Source accounts loaded. Please Load Data first.');
       return;
     }
 
@@ -417,21 +399,40 @@ export default function MatchingPage() {
         <h2 className="text-xl font-semibold">Account Matching</h2>
       </div>
 
+      {!dataLoaded && isDbReady && (
+        <Alert>
+          <InfoIcon className="h-4 w-4" />
+          <AlertDescription>
+            Database is empty. Click "Load All Data" to populate from Databricks.
+            This is a one-time operation - data will persist between sessions.
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {dataLoaded && (
+        <Alert className="bg-green-50 border-green-200">
+          <InfoIcon className="h-4 w-4 text-green-600" />
+          <AlertDescription className="text-green-800">
+            Data is loaded and persisted in PostgreSQL. You can start processing or reload data if needed.
+          </AlertDescription>
+        </Alert>
+      )}
+
       <div className="space-y-2 p-4 border rounded-lg bg-card">
         <p className="text-sm text-muted-foreground">{status}</p>
         {isDbReady && (
           <div className="grid grid-cols-4 gap-4 text-sm">
             <div>
-              <span className="font-semibold">Source:</span> {dbCounts.source}
+              <span className="font-semibold">Source:</span> {dbCounts.source.toLocaleString()}
             </div>
             <div>
-              <span className="font-semibold">Dimensions:</span> {dbCounts.dimensions}
+              <span className="font-semibold">Dimensions:</span> {dbCounts.dimensions.toLocaleString()}
             </div>
             <div>
-              <span className="font-semibold">Salesforce:</span> {dbCounts.salesforce}
+              <span className="font-semibold">Salesforce:</span> {dbCounts.salesforce.toLocaleString()}
             </div>
             <div>
-              <span className="font-semibold">Total:</span> {dbCounts.total}
+              <span className="font-semibold">Total:</span> {dbCounts.total.toLocaleString()}
             </div>
           </div>
         )}
@@ -441,8 +442,9 @@ export default function MatchingPage() {
         <Button
           onClick={handleLoadAccounts}
           disabled={isLoading || isProcessing || !isDbReady}
+          variant={dataLoaded ? "outline" : "default"}
         >
-          {isLoading ? 'Loading...' : 'Reload All'}
+          {isLoading ? 'Loading...' : dataLoaded ? 'Reload All Data' : 'Load All Data'}
         </Button>
         <Button
           onClick={() => handleProcessChunk(0)}
@@ -491,7 +493,7 @@ export default function MatchingPage() {
                     <TableCell>
                       {item.dimensionsMatch ? (
                         <div className="space-y-1">
-                          <p className="font-medium">{item.dimensionsMatch.Name}</p>
+                          <p className="font-medium">{item.dimensionsMatch.cuname || item.dimensionsMatch.Name}</p>
                           <Badge variant="outline" className="text-xs">
                             Score: {item.dimensionsScore}
                           </Badge>
@@ -526,7 +528,6 @@ export default function MatchingPage() {
         </div>
       )}
 
-      {/* Dialog для просмотра деталей */}
       <Dialog open={showDetails} onOpenChange={setShowDetails}>
         <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
           <DialogHeader>

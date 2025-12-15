@@ -1,12 +1,8 @@
 // lib/find-matches-chunked.ts
 
-import { AccountDBRow, getSQLiteClient } from './sqlite-client';
+import { AccountDBRow, getPostgresClient } from './postgres-client';
 import { calculateMatchScore } from './matching';
-import { MATCH_THRESHOLD, MAX_POSSIBLE_SCORE } from './matching-config';
-
-interface CountResult {
-  count: number;
-}
+import { MATCH_THRESHOLD } from './matching-config';
 
 export interface MatchedAccount {
   sourceAccount: any;
@@ -32,24 +28,17 @@ interface ChunkProcessingResult {
   };
 }
 
-/**
- * Обрабатывает чанк из Source таблицы
- * Для каждой записи ищет совпадения в Dimensions, затем в Salesforce
- */
 export const processSourceChunk = async (
   fieldMapping: Record<string, any>,
   chunkSize: number,
   startIndex: number = 0,
 ): Promise<ChunkProcessingResult> => {
-  const client = await getSQLiteClient();
+  const client = getPostgresClient();
 
   console.log(`[processSourceChunk] Starting chunk: size=${chunkSize}, startIndex=${startIndex}`);
+  console.log(`[processSourceChunk] Field mapping:`, fieldMapping);
 
-  // 1. Получаем общее количество Source записей
-  const totalResultArray = await client.query<CountResult>(
-    "SELECT COUNT(*) as count FROM accounts WHERE source = 'source'"
-  );
-  const totalSourceAccounts = totalResultArray?.[0]?.count || 0;
+  const totalSourceAccounts = await client.getTotalSourceCount();
 
   console.log(`[processSourceChunk] Total source accounts: ${totalSourceAccounts}`);
 
@@ -64,14 +53,7 @@ export const processSourceChunk = async (
     };
   }
 
-  // 2. Получаем чанк Source записей
-  const sourceAccountsRows = await client.query<AccountDBRow>(
-    `SELECT * FROM accounts
-     WHERE source = 'source'
-     ORDER BY id
-     LIMIT ? OFFSET ?`,
-    [chunkSize, startIndex]
-  );
+  const sourceAccountsRows = await client.getSourceAccountsChunk(chunkSize, startIndex);
 
   if (!sourceAccountsRows || sourceAccountsRows.length === 0) {
     console.log('[processSourceChunk] No source accounts in this chunk');
@@ -89,23 +71,19 @@ export const processSourceChunk = async (
   const matches: MatchedAccount[] = [];
   const stats = { both: 0, dimOnly: 0, sfOnly: 0, new: 0 };
 
-  // 3. Обрабатываем каждую Source запись
-  for (const sourceRow of sourceAccountsRows) {
-    let parsedSourceAccount: any;
-    try {
-      parsedSourceAccount = JSON.parse(sourceRow.raw_data);
-    } catch (error) {
-      console.error(`[processSourceChunk] Failed to parse source account ID ${sourceRow.id}:`, error);
-      continue;
-    }
+  for (let i = 0; i < sourceAccountsRows.length; i++) {
+    const sourceRow = sourceAccountsRows[i];
+    const parsedSourceAccount = sourceRow.raw_data;
 
-    console.log(`[processSourceChunk] Processing source account: ${parsedSourceAccount.Name}`);
+    console.log(`\n[processSourceChunk] ===== Processing source account ${i + 1}/${sourceAccountsRows.length} =====`);
+    console.log(`[processSourceChunk] Source account name: ${parsedSourceAccount.Name}`);
 
-    // 4. Ищем совпадения в Dimensions (по ВСЕМ записям)
+    // Ищем в Dimensions
+    console.log(`[processSourceChunk] Searching in Dimensions...`);
     const dimensionsMatches = await client.findPotentialMatches(
       parsedSourceAccount,
-      fieldMapping.source || fieldMapping.databricks, // Используем source mapping
-      'dimensions' // Указываем что ищем в dimensions
+      'dimensions',
+      100
     );
 
     console.log(`[processSourceChunk] Found ${dimensionsMatches?.length || 0} potential Dimensions matches`);
@@ -114,22 +92,17 @@ export const processSourceChunk = async (
     let bestDimensionsScore = 0;
     let bestDimensionsFields: string[] = [];
 
-    // Скорим все найденные Dimensions совпадения
     if (dimensionsMatches && dimensionsMatches.length > 0) {
       for (const dimRow of dimensionsMatches) {
-        let parsedDimAccount: any;
-        try {
-          parsedDimAccount = JSON.parse(dimRow.raw_data);
-        } catch (error) {
-          console.error(`[processSourceChunk] Failed to parse dimensions account ID ${dimRow.id}:`, error);
-          continue;
-        }
+        const parsedDimAccount = dimRow.raw_data;
 
         const { score, matchedFields } = calculateMatchScore(
           parsedSourceAccount,
           parsedDimAccount,
           fieldMapping
         );
+
+        console.log(`[processSourceChunk] Dimensions match score: ${score}, fields:`, matchedFields);
 
         if (score > bestDimensionsScore) {
           bestDimensionsScore = score;
@@ -141,11 +114,12 @@ export const processSourceChunk = async (
 
     console.log(`[processSourceChunk] Best Dimensions score: ${bestDimensionsScore}`);
 
-    // 5. Ищем совпадения в Salesforce (по ВСЕМ записям)
+    // Ищем в Salesforce
+    console.log(`[processSourceChunk] Searching in Salesforce...`);
     const salesforceMatches = await client.findPotentialMatches(
       parsedSourceAccount,
-      fieldMapping.source || fieldMapping.databricks,
-      'salesforce' // Указываем что ищем в salesforce
+      'salesforce',
+      100
     );
 
     console.log(`[processSourceChunk] Found ${salesforceMatches?.length || 0} potential Salesforce matches`);
@@ -156,19 +130,15 @@ export const processSourceChunk = async (
 
     if (salesforceMatches && salesforceMatches.length > 0) {
       for (const sfRow of salesforceMatches) {
-        let parsedSfAccount: any;
-        try {
-          parsedSfAccount = JSON.parse(sfRow.raw_data);
-        } catch (error) {
-          console.error(`[processSourceChunk] Failed to parse salesforce account ID ${sfRow.id}:`, error);
-          continue;
-        }
+        const parsedSfAccount = sfRow.raw_data;
 
         const { score, matchedFields } = calculateMatchScore(
           parsedSourceAccount,
           parsedSfAccount,
           fieldMapping
         );
+
+        console.log(`[processSourceChunk] Salesforce match score: ${score}, fields:`, matchedFields);
 
         if (score > bestSalesforceScore) {
           bestSalesforceScore = score;
@@ -180,9 +150,12 @@ export const processSourceChunk = async (
 
     console.log(`[processSourceChunk] Best Salesforce score: ${bestSalesforceScore}`);
 
-    // 6. Определяем финальный статус
     const hasDimensionsMatch = bestDimensionsScore >= MATCH_THRESHOLD;
     const hasSalesforceMatch = bestSalesforceScore >= MATCH_THRESHOLD;
+
+    console.log(`[processSourceChunk] Match threshold: ${MATCH_THRESHOLD}`);
+    console.log(`[processSourceChunk] Has Dimensions match: ${hasDimensionsMatch}`);
+    console.log(`[processSourceChunk] Has Salesforce match: ${hasSalesforceMatch}`);
 
     let finalStatus: 'BOTH' | 'DIM_ONLY' | 'SF_ONLY' | 'NEW';
     if (hasDimensionsMatch && hasSalesforceMatch) {
@@ -199,6 +172,8 @@ export const processSourceChunk = async (
       stats.new++;
     }
 
+    console.log(`[processSourceChunk] Final status: ${finalStatus}`);
+
     matches.push({
       sourceAccount: parsedSourceAccount,
       dimensionsMatch: bestDimensionsMatch,
@@ -211,7 +186,8 @@ export const processSourceChunk = async (
     });
   }
 
-  console.log(`[processSourceChunk] Completed. Stats:`, stats);
+  console.log(`\n[processSourceChunk] ===== Chunk completed =====`);
+  console.log(`[processSourceChunk] Stats:`, stats);
 
   return {
     matches,
