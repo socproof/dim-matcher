@@ -4,6 +4,21 @@ import { AccountDBRow, getPostgresClient } from './postgres-client';
 import { calculateMatchScore } from './matching';
 import { MATCH_THRESHOLD } from './matching-config';
 
+// Extract standard fields from DB row (already normalized during insert)
+function dbRowToStandardAccount(row: AccountDBRow): any {
+  return {
+    Name: row.name,
+    Phone: row.phone,
+    Website: row.website,
+    BillingStreet: row.billing_street,
+    BillingCity: row.billing_city,
+    BillingPostalCode: row.billing_postal_code,
+    BillingCountry: row.billing_country,
+    // Keep raw_data for display purposes
+    _raw: row.raw_data
+  };
+}
+
 export interface MatchedAccount {
   sourceAccount: any;
   dimensionsMatch: any | null;
@@ -73,7 +88,7 @@ export const processSourceChunk = async (
 
   for (let i = 0; i < sourceAccountsRows.length; i++) {
     const sourceRow = sourceAccountsRows[i];
-    const parsedSourceAccount = sourceRow.raw_data;
+    const parsedSourceAccount = dbRowToStandardAccount(sourceRow);
 
     console.log(`\n[processSourceChunk] ===== Processing source account ${i + 1}/${sourceAccountsRows.length} =====`);
     console.log(`[processSourceChunk] Source account name: ${parsedSourceAccount.Name}`);
@@ -94,7 +109,7 @@ export const processSourceChunk = async (
 
     if (dimensionsMatches && dimensionsMatches.length > 0) {
       for (const dimRow of dimensionsMatches) {
-        const parsedDimAccount = dimRow.raw_data;
+        const parsedDimAccount = dbRowToStandardAccount(dimRow);
 
         const { score, matchedFields } = calculateMatchScore(
           parsedSourceAccount,
@@ -130,7 +145,7 @@ export const processSourceChunk = async (
 
     if (salesforceMatches && salesforceMatches.length > 0) {
       for (const sfRow of salesforceMatches) {
-        const parsedSfAccount = sfRow.raw_data;
+        const parsedSfAccount = dbRowToStandardAccount(sfRow);
 
         const { score, matchedFields } = calculateMatchScore(
           parsedSourceAccount,
