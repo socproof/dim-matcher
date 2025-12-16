@@ -30,7 +30,7 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
         <main className="container mx-auto p-4">
-          <h1 className="text-2xl font-bold mb-6">Account Matcher POC</h1>
+          <h1 className="text-2xl font-bold mb-6">Dimensions/Salesforce Matcher POC</h1>
           {children}
           <Toaster />
         </main>

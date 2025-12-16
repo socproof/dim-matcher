@@ -13,8 +13,8 @@ function dbRowToStandardAccount(row: AccountDBRow): any {
     Name: row.name,
     Phone: row.phone,
     Website: row.website,
-    Email: row.email,              // NEW
-    EmailDomain: row.email_domain, // NEW
+    Email: row.email,
+    EmailDomain: row.email_domain,
     BillingStreet: row.billing_street,
     BillingCity: row.billing_city,
     BillingPostalCode: row.billing_postal_code,
@@ -71,7 +71,8 @@ export const processSourceChunk = async (
 ): Promise<ChunkProcessingResult> => {
   const client = getPostgresClient();
 
-  console.log(`[processSourceChunk] Starting: size=${chunkSize}, offset=${startIndex}`);
+  console.log(`[processSourceChunk] ========== START ==========`);
+  console.log(`[processSourceChunk] Chunk size: ${chunkSize}, Offset: ${startIndex}, AI enabled: ${enableAI}`);
   const startTime = Date.now();
 
   const totalSourceAccounts = await client.getTotalSourceCount();
@@ -93,17 +94,15 @@ export const processSourceChunk = async (
     };
   }
 
-  // Prepare source accounts with IDs
   const sourceAccounts = sourceAccountsRows.map((row, idx) => ({
     id: idx,
     row,
     account: dbRowToStandardAccount(row)
   }));
 
-  console.log(`[processSourceChunk] Batch searching ${sourceAccounts.length} accounts...`);
+  console.log(`[processSourceChunk] Loaded ${sourceAccounts.length} source accounts`);
   const searchStart = Date.now();
 
-  // BATCH SEARCH - one query for all Dimensions, one for all Salesforce
   const dimMatchesMap = await client.findPotentialMatchesBatch(
     sourceAccounts.map(s => ({ id: s.id, account: s.account })),
     'dimensions',
@@ -118,14 +117,12 @@ export const processSourceChunk = async (
 
   console.log(`[processSourceChunk] Batch search completed in ${Date.now() - searchStart}ms`);
 
-  // Process matches and calculate scores
   const pendingMatches: PendingMatch[] = [];
 
   for (const { id, account } of sourceAccounts) {
     const dimCandidates = dimMatchesMap.get(id) || [];
     const sfCandidates = sfMatchesMap.get(id) || [];
 
-    // Find best Dimensions match
     let bestDimMatch: any = null;
     let bestDimScore = 0;
     let bestDimFields: string[] = [];
@@ -140,7 +137,6 @@ export const processSourceChunk = async (
       }
     }
 
-    // Find best Salesforce match
     let bestSfMatch: any = null;
     let bestSfScore = 0;
     let bestSfFields: string[] = [];
@@ -169,15 +165,26 @@ export const processSourceChunk = async (
 
   console.log(`[processSourceChunk] Scoring completed in ${Date.now() - startTime}ms`);
 
-  // Step 2: Collect pairs for AI validation
+  // Build AI validation pairs with detailed logging
   const aiPairs: AccountPairForValidation[] = [];
   let pairId = 1;
-  const pairIdMap = new Map<string, number>(); // "index-type" -> pairId
+  const pairIdMap = new Map<string, number>();
+
+  console.log(`[AI Pair Building] ========== Creating pairs for AI validation ==========`);
 
   for (const pm of pendingMatches) {
+    const sourceName = pm.sourceAccount.Name || 'Unknown';
+
+    // Check Dimensions
     if (pm.dimensionsMatch && shouldValidateWithAI(pm.dimensionsScore)) {
       const key = `${pm.index}-dim`;
       pairIdMap.set(key, pairId);
+
+      console.log(`[AI Pair] ID=${pairId} | SourceIdx=${pm.index} | Type=DIM | Score=${pm.dimensionsScore}`);
+      console.log(`  Source: "${sourceName}"`);
+      console.log(`  Target: "${pm.dimensionsMatch.Name}"`);
+      console.log(`  Key: "${key}" → PairID: ${pairId}`);
+
       aiPairs.push({
         id: pairId++,
         source: pm.sourceAccount,
@@ -186,10 +193,20 @@ export const processSourceChunk = async (
         matchedFields: pm.dimensionsMatchedFields,
         targetType: 'dimensions'
       });
+    } else if (pm.dimensionsMatch) {
+      console.log(`[Skip DIM] SourceIdx=${pm.index} | Score=${pm.dimensionsScore} | Reason: ${pm.dimensionsScore < 20 ? 'too low (<20)' : 'too high (>100)'}`);
     }
+
+    // Check Salesforce
     if (pm.salesforceMatch && shouldValidateWithAI(pm.salesforceScore)) {
       const key = `${pm.index}-sf`;
       pairIdMap.set(key, pairId);
+
+      console.log(`[AI Pair] ID=${pairId} | SourceIdx=${pm.index} | Type=SF | Score=${pm.salesforceScore}`);
+      console.log(`  Source: "${sourceName}"`);
+      console.log(`  Target: "${pm.salesforceMatch.Name}"`);
+      console.log(`  Key: "${key}" → PairID: ${pairId}`);
+
       aiPairs.push({
         id: pairId++,
         source: pm.sourceAccount,
@@ -198,27 +215,54 @@ export const processSourceChunk = async (
         matchedFields: pm.salesforceMatchedFields,
         targetType: 'salesforce'
       });
+    } else if (pm.salesforceMatch) {
+      console.log(`[Skip SF] SourceIdx=${pm.index} | Score=${pm.salesforceScore} | Reason: ${pm.salesforceScore < 20 ? 'too low (<20)' : 'too high (>100)'}`);
     }
   }
 
-  console.log(`[processSourceChunk] Sending ${aiPairs.length} pairs to AI`);
+  console.log(`[AI Pair Building] Created ${aiPairs.length} pairs for validation`);
+  console.log(`[AI Pair Building] PairID Map:`, Object.fromEntries(pairIdMap));
 
-  // Step 3: Batch AI validation
+  // AI Validation
   let aiResults = new Map<number, AIValidationResult>();
   if (enableAI && aiPairs.length > 0) {
+    console.log(`[AI Validation] Sending ${aiPairs.length} pairs to AI...`);
     aiResults = await validateBatchWithAI(aiPairs);
+    console.log(`[AI Validation] Received ${aiResults.size} results from AI`);
+    console.log(`[AI Validation] Result IDs:`, Array.from(aiResults.keys()));
+  } else {
+    console.log(`[AI Validation] Skipped (enabled=${enableAI}, pairs=${aiPairs.length})`);
   }
 
-  // Step 4: Build final results
+  // Build final results with detailed mapping verification
+  console.log(`[Result Mapping] ========== Mapping AI results back to source accounts ==========`);
+
   const matches: MatchedAccount[] = [];
   const stats = { both: 0, dimOnly: 0, sfOnly: 0, new: 0, aiValidated: aiPairs.length };
 
   for (const pm of pendingMatches) {
-    const dimPairId = pairIdMap.get(`${pm.index}-dim`);
-    const sfPairId = pairIdMap.get(`${pm.index}-sf`);
+    const dimKey = `${pm.index}-dim`;
+    const sfKey = `${pm.index}-sf`;
+
+    const dimPairId = pairIdMap.get(dimKey);
+    const sfPairId = pairIdMap.get(sfKey);
 
     const dimAI = dimPairId ? aiResults.get(dimPairId) || null : null;
     const sfAI = sfPairId ? aiResults.get(sfPairId) || null : null;
+
+    console.log(`[Mapping] SourceIdx=${pm.index} "${pm.sourceAccount.Name}"`);
+    if (dimPairId !== undefined) {
+      console.log(`  DIM: Key="${dimKey}" → PairID=${dimPairId} → AI Result: ${dimAI ? `isMatch=${dimAI.isMatch}, conf=${dimAI.confidence}%` : 'NOT FOUND'}`);
+      if (dimAI && pm.dimensionsMatch) {
+        console.log(`    Expected: "${pm.sourceAccount.Name}" vs "${pm.dimensionsMatch.Name}"`);
+      }
+    }
+    if (sfPairId !== undefined) {
+      console.log(`  SF: Key="${sfKey}" → PairID=${sfPairId} → AI Result: ${sfAI ? `isMatch=${sfAI.isMatch}, conf=${sfAI.confidence}%` : 'NOT FOUND'}`);
+      if (sfAI && pm.salesforceMatch) {
+        console.log(`    Expected: "${pm.sourceAccount.Name}" vs "${pm.salesforceMatch.Name}"`);
+      }
+    }
 
     const dimStatus = pm.dimensionsMatch
       ? determineFinalStatus(pm.dimensionsScore, dimAI)
@@ -227,7 +271,6 @@ export const processSourceChunk = async (
       ? determineFinalStatus(pm.salesforceScore, sfAI)
       : 'NEW';
 
-    // Determine final status
     const hasDim = dimStatus === 'CONFIRMED' || dimStatus === 'REVIEW';
     const hasSf = sfStatus === 'CONFIRMED' || sfStatus === 'REVIEW';
 
@@ -262,7 +305,8 @@ export const processSourceChunk = async (
     });
   }
 
-  console.log(`[processSourceChunk] Completed. Stats:`, stats);
+  console.log(`[processSourceChunk] ========== COMPLETE ==========`);
+  console.log(`[processSourceChunk] Stats:`, stats);
 
   return {
     matches,

@@ -32,9 +32,15 @@ export async function POST(request: NextRequest) {
             return NextResponse.json({ results: [] });
         }
 
+        console.log('[AI Validate] ========== NEW REQUEST ==========');
+        console.log('[AI Validate] Received pair IDs:', pairs.map(p => p.id).join(', '));
+        console.log('[AI Validate] Pair details:');
+        for (const pair of pairs) {
+            console.log(`  ID=${pair.id}: "${pair.source.Name}" vs "${pair.target.Name}" (${pair.targetType})`);
+        }
+
         const prompt = buildBatchPrompt(pairs);
 
-        // Log prompt for debugging
         console.log('[AI Validate] Prompt length:', prompt.length);
         console.log('[AI Validate] First 500 chars:', prompt.substring(0, 500));
 
@@ -46,8 +52,8 @@ export async function POST(request: NextRequest) {
                 prompt,
                 stream: false,
                 options: {
-                    temperature: 0,      // Deterministic
-                    num_predict: 200,    // Enough for CSV output
+                    temperature: 0,
+                    num_predict: 200,
                 },
             }),
         });
@@ -60,12 +66,14 @@ export async function POST(request: NextRequest) {
 
         const data = await response.json();
 
-        // Log raw response for debugging
-        console.log('[AI Validate] Raw AI response:');
+        console.log('[AI Validate] ========== RAW RESPONSE START ==========');
         console.log(data.response);
-        console.log('[AI Validate] ---end of response---');
+        console.log('[AI Validate] ========== RAW RESPONSE END ==========');
+        console.log('[AI Validate] Response length:', data.response.length);
+        console.log('[AI Validate] First line:', data.response.split('\n')[0]);
+        console.log('[AI Validate] Last line:', data.response.split('\n').slice(-1)[0]);
 
-        const results = parseCSVResponse(data.response, pairs.length);
+        const results = parseCSVResponse(data.response, pairs);  // ← FIX: pass pairs, not pairs.length
 
         return NextResponse.json({ results });
     } catch (error) {
@@ -78,112 +86,151 @@ function buildBatchPrompt(pairs: AccountPair[]): string {
     let pairsText = '';
 
     for (const pair of pairs) {
+        const sourceWebsite = pair.source.Website || 'N/A';
+        const targetWebsite = pair.target.Website || 'N/A';
+
+        const sourceDomain = sourceWebsite !== 'N/A' ? sourceWebsite.replace(/^(https?:\/\/)?(www\.)?/, '').split('/')[0].toLowerCase() : 'N/A';
+        const targetDomain = targetWebsite !== 'N/A' ? targetWebsite.replace(/^(https?:\/\/)?(www\.)?/, '').split('/')[0].toLowerCase() : 'N/A';
+
         pairsText += `
 ---
 ID: ${pair.id}
 COMPANY_A: ${pair.source.Name || 'N/A'}
 PHONE_A: ${pair.source.Phone || 'N/A'}
-WEBSITE_A: ${pair.source.Website || 'N/A'}
-ADDRESS_A: ${[pair.source.BillingStreet, pair.source.BillingCity, pair.source.BillingPostalCode, pair.source.BillingCountry].filter(Boolean).join(', ') || 'N/A'}
+DOMAIN_A: ${sourceDomain}
+CITY_A: ${pair.source.BillingCity || 'N/A'}
+COUNTRY_A: ${pair.source.BillingCountry || 'N/A'}
 
 COMPANY_B: ${pair.target.Name || 'N/A'}
 PHONE_B: ${pair.target.Phone || 'N/A'}
-WEBSITE_B: ${pair.target.Website || 'N/A'}
-ADDRESS_B: ${[pair.target.BillingStreet, pair.target.BillingCity, pair.target.BillingPostalCode, pair.target.BillingCountry].filter(Boolean).join(', ') || 'N/A'}
-
-HEURISTIC_SCORE: ${pair.score}
+DOMAIN_B: ${targetDomain}
+CITY_B: ${pair.target.BillingCity || 'N/A'}
+COUNTRY_B: ${pair.target.BillingCountry || 'N/A'}
 `;
     }
 
-    return `You are a business data matching expert. Determine if each pair represents the SAME business entity.
+    return `Compare these company pairs and return CSV format.
 
-IMPORTANT RULES:
-1. Same website domain = SAME company (even with different addresses - could be multiple offices)
-2. Same phone number = SAME company  
-3. Similar name + same city = likely SAME company
-4. Similar name + DIFFERENT city/country = DIFFERENT companies
-5. Company suffixes (Ltd, Inc, Pty, Limited) should be IGNORED when comparing names
-6. Different addresses in same city could be branch offices = still SAME company
+RULES:
+- Same domain → YES, confidence 90
+- Same phone → YES, confidence 90
+- Same name + same city → YES, confidence 80
+- Different countries + different domains → NO, confidence 85
+- Different names → NO, confidence 80
 
-PAIRS TO ANALYZE:
+PAIRS:
 ${pairsText}
 
-Respond with EXACTLY one line per pair in this CSV format:
+REQUIRED OUTPUT FORMAT (one line per ID):
 ID,DECISION,CONFIDENCE,REASON
 
-Where:
-- ID: the pair number
-- DECISION: YES (same company) or NO (different companies)
-- CONFIDENCE: 0-100 (how sure you are)
-- REASON: brief explanation (no commas allowed in reason)
+DECISION: YES or NO (nothing else)
+CONFIDENCE: number from 0 to 100 (just the number)
+REASON: short text without commas
 
-Example response:
-1,YES,95,Same website confirms identical business
-2,NO,85,Same name but different countries
-3,YES,80,Matching phone number and similar address
+CORRECT EXAMPLES:
+1,YES,95,Same domain example.com
+2,NO,90,Different countries USA vs UK
+3,YES,85,Same phone and city
 
-YOUR RESPONSE (only CSV lines):`;
+WRONG EXAMPLES (do not do this):
+1,NO;Different countries  ← WRONG (missing confidence number)
+2,YES,90%+ Same domain ← WRONG (% symbol in confidence field)
+
+Now analyze the pairs. Reply with ONLY CSV lines:`;
 }
 
-function parseCSVResponse(response: string, expectedCount: number): ValidationResult[] {
+function parseCSVResponse(response: string, pairs: AccountPair[]): ValidationResult[] {
     const results: ValidationResult[] = [];
+    const foundIds = new Set<number>();
+    const expectedIds = new Set(pairs.map(p => p.id));
 
-    // Clean up response - remove markdown, extra text
     let cleanResponse = response
         .replace(/```csv/gi, '')
         .replace(/```/g, '')
-        .replace(/^[^0-9]+/gm, '') // Remove lines not starting with numbers
+        .replace(/^[^0-9]+/gm, '')
         .trim();
 
     const lines = cleanResponse.split('\n');
 
+    console.log('[parseCSVResponse] Expected IDs:', Array.from(expectedIds).join(', '));
     console.log('[parseCSVResponse] Cleaned lines:', lines);
 
     for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
 
-        // Match pattern: ID,YES/NO,NUMBER,TEXT
-        const match = trimmed.match(/^(\d+)\s*,\s*(YES|NO)\s*,\s*(\d+)\s*,\s*(.+)$/i);
+        // Split by comma
+        const parts = trimmed.split(',').map(p => p.trim());
 
-        if (match) {
-            const id = parseInt(match[1]);
-            const isMatch = match[2].toUpperCase() === 'YES';
-            const confidence = Math.min(100, Math.max(0, parseInt(match[3])));
-            const reasoning = match[4].trim();
+        if (parts.length < 2) {
+            console.warn('[parseCSVResponse] Skipping malformed line:', trimmed);
+            continue;
+        }
 
-            results.push({ id, isMatch, confidence, reasoning });
-            console.log(`[parseCSVResponse] Parsed: id=${id}, match=${isMatch}, conf=${confidence}`);
-        } else {
-            // Try alternative parsing for malformed lines
-            const parts = trimmed.split(',');
-            if (parts.length >= 3) {
-                const id = parseInt(parts[0]);
-                if (!isNaN(id)) {
-                    const decision = parts[1]?.toUpperCase().trim();
-                    const isMatch = decision === 'YES' || decision === 'Y' || decision === 'TRUE';
-                    const confidence = parseInt(parts[2]) || 50;
-                    const reasoning = parts.slice(3).join(' ').trim() || 'No reason provided';
+        const id = parseInt(parts[0]);
+        if (isNaN(id)) {
+            console.warn('[parseCSVResponse] Invalid ID in line:', trimmed);
+            continue;
+        }
 
-                    results.push({ id, isMatch, confidence, reasoning });
-                    console.log(`[parseCSVResponse] Fallback parsed: id=${id}, match=${isMatch}`);
-                }
+        if (!expectedIds.has(id)) {
+            console.warn(`[parseCSVResponse] AI returned unexpected ID ${id}, skipping`);
+            continue;
+        }
+
+        if (foundIds.has(id)) {
+            console.warn(`[parseCSVResponse] Duplicate ID ${id}, skipping`);
+            continue;
+        }
+
+        const decision = parts[1].toUpperCase();
+        const isMatch = decision === 'YES' || decision === 'Y';
+
+        let confidence = 50;
+        let reasoning = 'No reason provided';
+
+        // Check if parts[2] is a number (confidence)
+        if (parts.length >= 3) {
+            const confStr = parts[2].replace(/%.*$/, '').trim(); // Remove % and everything after
+            const parsedConf = parseInt(confStr);
+
+            if (!isNaN(parsedConf) && parsedConf >= 0 && parsedConf <= 100) {
+                // parts[2] is confidence
+                confidence = parsedConf;
+                reasoning = parts.slice(3).join(',').trim() || 'No reason provided';
+            } else {
+                // parts[2] is reasoning (AI skipped confidence)
+                reasoning = parts.slice(2).join(',').trim();
+                confidence = isMatch ? 70 : 85; // Default based on decision
             }
         }
+
+        results.push({ id, isMatch, confidence, reasoning });
+        foundIds.add(id);
+
+        console.log(`[parseCSVResponse] ✓ Parsed ID=${id}, match=${isMatch}, conf=${confidence}, reason="${reasoning}"`);
     }
 
-    // Fill missing results
-    for (let i = 1; i <= expectedCount; i++) {
-        if (!results.find(r => r.id === i)) {
-            console.log(`[parseCSVResponse] Missing result for id=${i}, adding default`);
+    // Add defaults for missing IDs
+    const missingIds = Array.from(expectedIds).filter(id => !foundIds.has(id));
+
+    if (missingIds.length > 0) {
+        console.warn(`[parseCSVResponse] ❌ Missing results for IDs: ${missingIds.join(', ')}`);
+
+        for (const id of missingIds) {
             results.push({
-                id: i,
+                id,
                 isMatch: false,
                 confidence: 0,
-                reasoning: 'AI did not return result for this pair'
+                reasoning: 'AI did not return result'
             });
         }
     }
 
-    return results.sort((a, b) => a.id - b.id);
+    const sortedResults = results.sort((a, b) => a.id - b.id);
+
+    console.log('[parseCSVResponse] Final:', sortedResults.map(r => `ID=${r.id}:${r.isMatch ? 'YES' : 'NO'}@${r.confidence}%`).join(', '));
+
+    return sortedResults;
 }

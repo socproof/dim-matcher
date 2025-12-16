@@ -34,6 +34,8 @@ function chunkArray<T>(array: T[], size: number): T[][] {
 async function sendBatchRequest(pairs: AccountPairForValidation[]): Promise<Map<number, AIValidationResult>> {
   const resultMap = new Map<number, AIValidationResult>();
 
+  console.log(`[sendBatchRequest] Sending pair IDs: ${pairs.map(p => p.id).join(', ')}`);
+
   try {
     const response = await fetch('/api/ai/validate', {
       method: 'POST',
@@ -47,14 +49,18 @@ async function sendBatchRequest(pairs: AccountPairForValidation[]): Promise<Map<
 
     const data = await response.json();
 
+    console.log(`[sendBatchRequest] Received ${data.results.length} results for IDs: ${data.results.map((r: any) => r.id).join(', ')}`);
+
     for (const result of data.results) {
       resultMap.set(result.id, {
         isMatch: result.isMatch,
         confidence: result.confidence,
         reasoning: result.reasoning
       });
+      console.log(`[sendBatchRequest] Mapped ID=${result.id}: isMatch=${result.isMatch}, conf=${result.confidence}%`);
     }
   } catch (error) {
+    console.error(`[sendBatchRequest] Error for pair IDs ${pairs.map(p => p.id).join(', ')}:`, error);
     // Fill with error results
     for (const pair of pairs) {
       resultMap.set(pair.id, {
@@ -83,25 +89,42 @@ export async function validateBatchWithAI(
   const PARALLEL_BATCHES = 2;
 
   const batches = chunkArray(pairs, BATCH_SIZE);
-  console.log(`[AI Validation] Split ${pairs.length} pairs into ${batches.length} batches`);
+  console.log(`[AI Validation] Split ${pairs.length} pairs into ${batches.length} batches of ${BATCH_SIZE}`);
 
   // Process batches in parallel groups
   for (let i = 0; i < batches.length; i += PARALLEL_BATCHES) {
     const parallelBatches = batches.slice(i, i + PARALLEL_BATCHES);
 
-    console.log(`[AI Validation] Processing batches ${i + 1}-${Math.min(i + PARALLEL_BATCHES, batches.length)}/${batches.length}`);
+    console.log(`[AI Validation] Processing batch group ${Math.floor(i / PARALLEL_BATCHES) + 1}: batches ${i + 1}-${Math.min(i + PARALLEL_BATCHES, batches.length)}/${batches.length}`);
+    
+    // Log which IDs are in each parallel batch
+    parallelBatches.forEach((batch, idx) => {
+      console.log(`  Parallel batch ${idx + 1} IDs: ${batch.map(p => p.id).join(', ')}`);
+    });
 
     const results = await Promise.all(
       parallelBatches.map(batch => sendBatchRequest(batch))
     );
 
-    // Merge results
-    for (const batchResult of results) {
+    console.log(`[AI Validation] Received ${results.length} batch results`);
+
+    // Merge results - THIS IS THE KEY FIX
+    for (let batchIdx = 0; batchIdx < results.length; batchIdx++) {
+      const batchResult = results[batchIdx];
+      console.log(`[AI Validation] Merging batch ${batchIdx + 1} with ${batchResult.size} results`);
+      
       for (const [id, result] of batchResult) {
+        if (resultMap.has(id)) {
+          console.warn(`[AI Validation] WARNING: Duplicate ID ${id} found! Overwriting...`);
+        }
         resultMap.set(id, result);
+        console.log(`[AI Validation] Final map: ID=${id} → isMatch=${result.isMatch}, conf=${result.confidence}%`);
       }
     }
   }
+
+  console.log(`[AI Validation] Complete. Total results: ${resultMap.size}`);
+  console.log(`[AI Validation] Final result IDs: ${Array.from(resultMap.keys()).sort((a, b) => a - b).join(', ')}`);
 
   return resultMap;
 }
