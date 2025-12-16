@@ -9,11 +9,12 @@ import { Badge } from '@/components/ui/badge';
 import { getPostgresClient } from '@/lib/postgres-client';
 import { processSourceChunk, MatchedAccount } from '@/lib/find-matches-chunked';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { InfoIcon } from 'lucide-react';
+import { InfoIcon, Download } from 'lucide-react';
 import { Checkbox } from '@/components/ui/checkbox';
 import { PROCESSING, DEV_LIMITS, applyLimit, isDevMode } from '@/lib/config';
 
 const CHUNK_SIZE = PROCESSING.chunkSize;
+const MATCH_THRESHOLD = 100;
 
 export default function MatchingPage() {
   const [status, setStatus] = useState<string>('Checking database...');
@@ -41,6 +42,7 @@ export default function MatchingPage() {
   const [stats, setStats] = useState({ both: 0, dimOnly: 0, sfOnly: 0, new: 0 });
   const [dataLoaded, setDataLoaded] = useState(false);
   const [enableAI, setEnableAI] = useState(true);
+  const [hasProcessedAnyChunk, setHasProcessedAnyChunk] = useState(false);
 
   const loadFieldMapping = useCallback(() => {
     const defaults = getDefaultMapping();
@@ -49,7 +51,6 @@ export default function MatchingPage() {
     if (storedMapping) {
       try {
         const parsed = JSON.parse(storedMapping);
-        // Merge with defaults to ensure all keys exist
         return {
           source: parsed.source || defaults.source,
           dimensions: parsed.dimensions || defaults.dimensions,
@@ -151,6 +152,7 @@ export default function MatchingPage() {
     setCurrentChunkIndex(0);
     setHasMoreChunks(false);
     setStats({ both: 0, dimOnly: 0, sfOnly: 0, new: 0 });
+    setHasProcessedAnyChunk(false);
 
     try {
       const client = getPostgresClient();
@@ -162,46 +164,43 @@ export default function MatchingPage() {
       console.log('[LoadAccounts] Config:', config);
       console.log('[LoadAccounts] Dev Limits:', DEV_LIMITS);
 
-      // Load Source
       setStatus('Loading Source accounts...');
       const sourceData = await loadTableData(
         config.apiUrl,
         config.accessToken,
         config.warehouseId,
         config.sourceTable,
-        DEV_LIMITS.source || 20000  // Limit directly in query
+        DEV_LIMITS.source || 20000
       );
       console.log('[LoadAccounts] Source data loaded:', sourceData.length);
 
       setStatus(`Saving ${sourceData.length} Source accounts to database...`);
       await client.insertAccountsBatch('source', sourceData);
 
-      // Load Dimensions
       setStatus('Loading Dimensions accounts...');
       const dimensionsData = await loadTableInChunks(
         config.apiUrl,
         config.accessToken,
         config.warehouseId,
         config.dimensionsTable,
-        5000,  // chunk size
+        5000,
         (loaded) => setStatus(`Loading Dimensions: ${loaded} records loaded...`),
-        DEV_LIMITS.dimensions || undefined  // MAX RECORDS LIMIT
+        DEV_LIMITS.dimensions || undefined
       );
       console.log('[LoadAccounts] Dimensions data loaded:', dimensionsData.length);
 
       setStatus(`Saving ${dimensionsData.length} Dimensions accounts to database...`);
       await client.insertAccountsBatch('dimensions', dimensionsData);
 
-      // Load Salesforce
       setStatus('Loading Salesforce accounts...');
       const salesforceData = await loadTableInChunks(
         config.apiUrl,
         config.accessToken,
         config.warehouseId,
         config.salesforceTable,
-        5000,  // chunk size
+        5000,
         (loaded) => setStatus(`Loading Salesforce: ${loaded} records loaded...`),
-        DEV_LIMITS.salesforce || undefined  // MAX RECORDS LIMIT
+        DEV_LIMITS.salesforce || undefined
       );
       console.log('[LoadAccounts] Salesforce data loaded:', salesforceData.length);
 
@@ -230,7 +229,6 @@ export default function MatchingPage() {
     }
   };
 
-  // Вспомогательная функция для загрузки одной таблицы
   const loadTableData = async (
     apiUrl: string,
     accessToken: string,
@@ -265,7 +263,7 @@ export default function MatchingPage() {
     tablePath: string,
     chunkSize: number,
     onProgress?: (loaded: number) => void,
-    maxRecords?: number  // NEW: maximum records to load
+    maxRecords?: number
   ): Promise<any[]> => {
     const allData: any[] = [];
     let offset = 0;
@@ -275,13 +273,11 @@ export default function MatchingPage() {
     while (hasMore) {
       iteration++;
 
-      // Check if we've reached the limit
       if (maxRecords && allData.length >= maxRecords) {
         console.log(`[loadTableInChunks] ${tablePath} - Reached limit of ${maxRecords} records, stopping`);
         break;
       }
 
-      // Calculate how many records we still need
       const remainingNeeded = maxRecords ? maxRecords - allData.length : chunkSize;
       const currentChunkSize = Math.min(chunkSize, remainingNeeded);
 
@@ -329,7 +325,6 @@ export default function MatchingPage() {
           onProgress(allData.length);
         }
 
-        // Check if we've reached the limit after adding data
         if (maxRecords && allData.length >= maxRecords) {
           console.log(`[loadTableInChunks] ${tablePath} - Reached limit of ${maxRecords} records`);
           hasMore = false;
@@ -350,7 +345,6 @@ export default function MatchingPage() {
       }
     }
 
-    // Trim to exact limit if we got more
     const result = maxRecords && allData.length > maxRecords
       ? allData.slice(0, maxRecords)
       : allData;
@@ -358,7 +352,6 @@ export default function MatchingPage() {
     console.log(`[loadTableInChunks] ${tablePath} - Completed. Total records: ${result.length}`);
     return result;
   };
-
 
   const handleProcessChunk = async (startIndex: number) => {
     if (!isDbReady) {
@@ -388,6 +381,7 @@ export default function MatchingPage() {
       setHasMoreChunks(result.hasMore);
       setCurrentChunkIndex(startIndex);
       setStats(result.stats);
+      setHasProcessedAnyChunk(true);
 
       setStatus(`Processed ${result.processedCount} accounts. Status: ${result.stats.both} BOTH, ${result.stats.dimOnly} DIM_ONLY, ${result.stats.sfOnly} SF_ONLY, ${result.stats.new} NEW`);
 
@@ -424,6 +418,46 @@ export default function MatchingPage() {
     }
   };
 
+  const handleExportResults = () => {
+    console.log('[ExportResults] Exporting results...');
+    // TODO: Implement export logic
+  };
+
+  const handleMergeBoth = (item: MatchedAccount) => {
+    console.log('[MergeBoth]', item);
+    // TODO: Implement merge both logic
+  };
+
+  const handleMergeDimensions = (item: MatchedAccount) => {
+    console.log('[MergeDimensions]', item);
+    // TODO: Implement merge dimensions logic
+  };
+
+  const handleMergeSalesforce = (item: MatchedAccount) => {
+    console.log('[MergeSalesforce]', item);
+    // TODO: Implement merge salesforce logic
+  };
+
+  const handleCreateNew = (item: MatchedAccount) => {
+    console.log('[CreateNew]', item);
+    // TODO: Implement create new logic
+  };
+
+  const handleNeedsReview = (item: MatchedAccount) => {
+    console.log('[NeedsReview]', item);
+    // TODO: Implement needs review logic
+  };
+
+  const getMatchStatus = (item: MatchedAccount): string => {
+    const dimMatched = item.dimensionsScore >= MATCH_THRESHOLD;
+    const sfMatched = item.salesforceScore >= MATCH_THRESHOLD;
+
+    if (dimMatched && sfMatched) return 'BOTH';
+    if (dimMatched) return 'DIM_ONLY';
+    if (sfMatched) return 'SF_ONLY';
+    return 'NEW';
+  };
+
   const getStatusBadge = (status: string) => {
     switch (status) {
       case 'BOTH':
@@ -443,6 +477,138 @@ export default function MatchingPage() {
       default:
         return <Badge variant="outline">{status}</Badge>;
     }
+  };
+
+  const renderMatchInfo = (
+    match: any | null,
+    score: number,
+    status: string,
+    aiResult: { confidence: number; reasoning: string; decision: string } | undefined,
+    isMatched: boolean
+  ) => {
+    if (!match && score === 0) {
+      return <span className="text-muted-foreground italic text-sm">No potential match</span>;
+    }
+
+    return (
+      <div className="space-y-1">
+        {isMatched && match ? (
+          <p className="font-medium text-green-700">{match.Name}</p>
+        ) : match ? (
+          <p className="font-medium text-gray-600">{match.Name}</p>
+        ) : null}
+
+        {score > 0 && (
+          <Badge
+            variant="outline"
+            className={`text-xs ${isMatched ? 'bg-green-50 border-green-300' : 'bg-gray-50'}`}
+          >
+            Score: {score}
+          </Badge>
+        )}
+
+        {!isMatched && score > 0 && score < 50 && (
+          <p className="text-xs text-muted-foreground italic">
+            Below threshold ({MATCH_THRESHOLD})
+          </p>
+        )}
+
+        {!isMatched && score >= 50 && score < MATCH_THRESHOLD && (
+          <p className="text-xs text-yellow-600 italic font-medium">
+            Needs Review (50-{MATCH_THRESHOLD - 1})
+          </p>
+        )}
+
+        {aiResult && (
+          <div className="text-xs space-y-1">
+            <Badge
+              variant="outline"
+              className={
+                aiResult.decision === 'CONFIRMED' ? 'bg-green-100 border-green-400' :
+                  aiResult.decision === 'REJECTED' ? 'bg-red-100 border-red-400' :
+                    'bg-yellow-100 border-yellow-400'
+              }
+            >
+              AI: {aiResult.confidence}% {aiResult.decision}
+            </Badge>
+            <p className="text-muted-foreground">{aiResult.reasoning}</p>
+          </div>
+        )}
+
+
+      </div>
+    );
+  };
+
+  const renderActionButtons = (item: MatchedAccount) => {
+    const dimScore = item.dimensionsScore || 0;
+    const sfScore = item.salesforceScore || 0;
+    const dimMatched = dimScore >= MATCH_THRESHOLD;
+    const sfMatched = sfScore >= MATCH_THRESHOLD;
+
+    return (
+      <div className="flex flex-col gap-1">
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => handleViewDetails(item)}
+          className="w-full"
+        >
+          View Details
+        </Button>
+
+        {dimMatched && sfMatched && (
+          <Button
+            size="sm"
+            className="bg-green-600 hover:bg-green-700 w-full"
+            onClick={() => handleMergeBoth(item)}
+          >
+            Merge Both
+          </Button>
+        )}
+
+        {dimMatched && !sfMatched && (
+          <Button
+            size="sm"
+            className="bg-blue-600 hover:bg-blue-700 w-full"
+            onClick={() => handleMergeDimensions(item)}
+          >
+            Merge Dimensions
+          </Button>
+        )}
+
+        {!dimMatched && sfMatched && (
+          <Button
+            size="sm"
+            className="bg-purple-600 hover:bg-purple-700 w-full"
+            onClick={() => handleMergeSalesforce(item)}
+          >
+            Merge Salesforce
+          </Button>
+        )}
+
+        {dimScore <= 50 && sfScore <= 50 && (
+          <Button
+            size="sm"
+            variant="secondary"
+            className="w-full"
+            onClick={() => handleCreateNew(item)}
+          >
+            Create New
+          </Button>
+        )}
+
+        {((dimScore > 50 && dimScore < MATCH_THRESHOLD) || (sfScore > 50 && sfScore < MATCH_THRESHOLD)) && (
+          <Button
+            size="sm"
+            className="bg-yellow-600 hover:bg-yellow-700 w-full"
+            onClick={() => handleNeedsReview(item)}
+          >
+            Needs Review
+          </Button>
+        )}
+      </div>
+    );
   };
 
   return (
@@ -500,7 +666,7 @@ export default function MatchingPage() {
         </Button>
         <Button
           onClick={() => handleProcessChunk(0)}
-          disabled={isLoading || isProcessing || dbCounts.source === 0}
+          disabled={isLoading || isProcessing || dbCounts.source === 0 || hasProcessedAnyChunk}
           variant="secondary"
         >
           {isProcessing ? 'Processing...' : 'Process First Chunk'}
@@ -516,6 +682,16 @@ export default function MatchingPage() {
         )}
 
         <Button
+          onClick={handleExportResults}
+          variant="outline"
+          disabled={true}
+          className="gap-2"
+        >
+          <Download className="h-4 w-4" />
+          Export Results
+        </Button>
+
+        <Button
           onClick={handleDiagnose}
           variant="outline"
           size="sm"
@@ -524,7 +700,6 @@ export default function MatchingPage() {
           Diagnose DB
         </Button>
 
-        {/* AI Toggle */}
         <div className="flex items-center gap-2 ml-4 border-l pl-4">
           <Checkbox
             id="enableAI"
@@ -555,62 +730,44 @@ export default function MatchingPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {currentChunkData.map((item, idx) => (
-                  <TableRow key={idx}>
-                    <TableCell>
-                      <div className="space-y-1">
-                        <p className="font-medium">{item.sourceAccount?.Name || 'N/A'}</p>
-                        <p className="text-xs text-muted-foreground">{item.sourceAccount?.Phone || ''}</p>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      {item.dimensionsMatch ? (
+                {currentChunkData.map((item, idx) => {
+                  const matchStatus = getMatchStatus(item);
+                  const dimMatched = item.dimensionsScore >= MATCH_THRESHOLD;
+                  const sfMatched = item.salesforceScore >= MATCH_THRESHOLD;
+
+                  return (
+                    <TableRow key={idx}>
+                      <TableCell>
                         <div className="space-y-1">
-                          <p className="font-medium">{item.dimensionsMatch.Name}</p>
-                          <div className="flex gap-1 flex-wrap">
-                            <Badge variant="outline" className="text-xs">
-                              Score: {item.dimensionsScore}
-                            </Badge>
-                            {getStatusBadge(item.dimensionsStatus)}
-                          </div>
-                          {item.dimensionsAI && (
-                            <p className="text-xs text-muted-foreground">
-                              AI: {item.dimensionsAI.confidence}% - {item.dimensionsAI.reasoning}
-                            </p>
-                          )}
+                          <p className="font-medium">{item.sourceAccount?.Name || 'N/A'}</p>
+                          <p className="text-xs text-muted-foreground">{item.sourceAccount?.Phone || ''}</p>
                         </div>
-                      ) : (
-                        <span className="text-muted-foreground italic text-sm">No match</span>
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      {item.salesforceMatch ? (
-                        <div className="space-y-1">
-                          <p className="font-medium">{item.salesforceMatch.Name}</p>
-                          <div className="flex gap-1 flex-wrap">
-                            <Badge variant="outline" className="text-xs">
-                              Score: {item.salesforceScore}
-                            </Badge>
-                            {getStatusBadge(item.salesforceStatus)}
-                          </div>
-                          {item.salesforceAI && (
-                            <p className="text-xs text-muted-foreground">
-                              AI: {item.salesforceAI.confidence}% - {item.salesforceAI.reasoning}
-                            </p>
-                          )}
-                        </div>
-                      ) : (
-                        <span className="text-muted-foreground italic text-sm">No match</span>
-                      )}
-                    </TableCell>
-                    <TableCell>{getStatusBadge(item.finalStatus)}</TableCell>
-                    <TableCell>
-                      <Button size="sm" variant="outline" onClick={() => handleViewDetails(item)}>
-                        View Details
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                      </TableCell>
+                      <TableCell>
+                        {renderMatchInfo(
+                          item.dimensionsMatch,
+                          item.dimensionsScore,
+                          item.dimensionsStatus,
+                          item.dimensionsAI,
+                          dimMatched
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {renderMatchInfo(
+                          item.salesforceMatch,
+                          item.salesforceScore,
+                          item.salesforceStatus,
+                          item.salesforceAI,
+                          sfMatched
+                        )}
+                      </TableCell>
+                      <TableCell>{getStatusBadge(matchStatus)}</TableCell>
+                      <TableCell>
+                        {renderActionButtons(item)}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           </div>
@@ -632,34 +789,54 @@ export default function MatchingPage() {
                   </pre>
                 </div>
                 <div className="border rounded p-3">
-                  <h4 className="font-semibold mb-2">Dimensions Match</h4>
+                  <h4 className="font-semibold mb-2">
+                    Dimensions Match
+                    {selectedItem.dimensionsScore >= MATCH_THRESHOLD && ' ✓'}
+                  </h4>
                   {selectedItem.dimensionsMatch ? (
-                    <pre className="text-xs overflow-auto">
-                      {JSON.stringify(selectedItem.dimensionsMatch, null, 2)}
-                    </pre>
+                    <>
+                      <pre className="text-xs overflow-auto">
+                        {JSON.stringify(selectedItem.dimensionsMatch, null, 2)}
+                      </pre>
+                      <div className="mt-2 space-y-1">
+                        <Badge>Score: {selectedItem.dimensionsScore}</Badge>
+                        {selectedItem.dimensionsAI && (
+                          <Badge variant="outline">
+                            AI: {selectedItem.dimensionsAI.confidence}% {selectedItem.dimensionsAI.decision}
+                          </Badge>
+                        )}
+                      </div>
+                    </>
                   ) : (
-                    <p className="text-muted-foreground italic">No match</p>
-                  )}
-                  {selectedItem.dimensionsScore > 0 && (
-                    <Badge className="mt-2">Score: {selectedItem.dimensionsScore}</Badge>
+                    <p className="text-muted-foreground italic">No match found</p>
                   )}
                 </div>
                 <div className="border rounded p-3">
-                  <h4 className="font-semibold mb-2">Salesforce Match</h4>
+                  <h4 className="font-semibold mb-2">
+                    Salesforce Match
+                    {selectedItem.salesforceScore >= MATCH_THRESHOLD && ' ✓'}
+                  </h4>
                   {selectedItem.salesforceMatch ? (
-                    <pre className="text-xs overflow-auto">
-                      {JSON.stringify(selectedItem.salesforceMatch, null, 2)}
-                    </pre>
+                    <>
+                      <pre className="text-xs overflow-auto">
+                        {JSON.stringify(selectedItem.salesforceMatch, null, 2)}
+                      </pre>
+                      <div className="mt-2 space-y-1">
+                        <Badge>Score: {selectedItem.salesforceScore}</Badge>
+                        {selectedItem.salesforceAI && (
+                          <Badge variant="outline">
+                            AI: {selectedItem.salesforceAI.confidence}% {selectedItem.salesforceAI.decision}
+                          </Badge>
+                        )}
+                      </div>
+                    </>
                   ) : (
-                    <p className="text-muted-foreground italic">No match</p>
-                  )}
-                  {selectedItem.salesforceScore > 0 && (
-                    <Badge className="mt-2">Score: {selectedItem.salesforceScore}</Badge>
+                    <p className="text-muted-foreground italic">No match found</p>
                   )}
                 </div>
               </div>
               <div className="flex justify-center">
-                {getStatusBadge(selectedItem.finalStatus)}
+                {getStatusBadge(getMatchStatus(selectedItem))}
               </div>
             </div>
           )}

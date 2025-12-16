@@ -1,3 +1,5 @@
+// lib/postgres-client.ts
+
 import { 
   normalizeCompanyName, 
   normalizePhone, 
@@ -43,6 +45,41 @@ interface QueryResult<T> {
   rowCount: number;
 }
 
+// Sanitize value to remove null bytes and invalid UTF-8 characters
+function sanitizeValue(value: any): any {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  
+  if (typeof value === 'string') {
+    // Remove null bytes and control characters except newlines and tabs
+    return value
+      .replace(/\u0000/g, '') // Remove null bytes
+      .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, ''); // Remove other control chars
+  }
+  
+  if (typeof value === 'object') {
+    // Recursively sanitize objects and arrays
+    if (Array.isArray(value)) {
+      return value.map(item => sanitizeValue(item));
+    }
+    
+    const sanitized: any = {};
+    for (const [key, val] of Object.entries(value)) {
+      sanitized[key] = sanitizeValue(val);
+    }
+    return sanitized;
+  }
+  
+  return value;
+}
+
+// Safely stringify JSON with sanitization
+function safeJsonStringify(obj: any): string {
+  const sanitized = sanitizeValue(obj);
+  return JSON.stringify(sanitized);
+}
+
 class PostgresClient {
   private baseUrl: string;
 
@@ -66,14 +103,14 @@ class PostgresClient {
   }
 
   private normalizeAccount(account: any): NormalizedAccount {
-    const name = account.Name || account.name || account.cuname || '';
-    const phone = account.Phone || account.phone || account.cuphone || '';
-    const website = account.Website || account.website || '';
-    const email = account.Email || account.email || account.cu_email || '';
-    const billingStreet = account.BillingStreet || account.billing_street || account.cuaddress || '';
-    const billingCity = account.BillingCity || account.billing_city || account.cu_address_user1 || '';
-    const billingPostalCode = account.BillingPostalCode || account.billing_postal_code || account.cupostcode || '';
-    const billingCountry = account.BillingCountry || account.billing_country || account.cu_country || '';
+    const name = sanitizeValue(account.Name || account.name || account.cuname || '');
+    const phone = sanitizeValue(account.Phone || account.phone || account.cuphone || '');
+    const website = sanitizeValue(account.Website || account.website || '');
+    const email = sanitizeValue(account.Email || account.email || account.cu_email || '');
+    const billingStreet = sanitizeValue(account.BillingStreet || account.billing_street || account.cuaddress || '');
+    const billingCity = sanitizeValue(account.BillingCity || account.billing_city || account.cu_address_user1 || '');
+    const billingPostalCode = sanitizeValue(account.BillingPostalCode || account.billing_postal_code || account.cupostcode || '');
+    const billingCountry = sanitizeValue(account.BillingCountry || account.billing_country || account.cu_country || '');
 
     // Normalize website, or extract domain from email if no website
     let normalizedWebsite = '';
@@ -139,18 +176,18 @@ class PostgresClient {
 
     await this.query(sql, [
       source,
-      normalized.Name,
-      normalized.NormalizedName,
-      normalized.Phone,
-      normalized.NormalizedPhone,
-      normalized.Website,
-      normalized.NormalizedWebsite,
-      normalized.BillingStreet,
-      normalized.NormalizedBillingStreet,
-      normalized.BillingCity,
-      normalized.BillingPostalCode,
-      normalized.BillingCountry,
-      JSON.stringify(account)
+      sanitizeValue(normalized.Name),
+      sanitizeValue(normalized.NormalizedName),
+      sanitizeValue(normalized.Phone),
+      sanitizeValue(normalized.NormalizedPhone),
+      sanitizeValue(normalized.Website),
+      sanitizeValue(normalized.NormalizedWebsite),
+      sanitizeValue(normalized.BillingStreet),
+      sanitizeValue(normalized.NormalizedBillingStreet),
+      sanitizeValue(normalized.BillingCity),
+      sanitizeValue(normalized.BillingPostalCode),
+      sanitizeValue(normalized.BillingCountry),
+      safeJsonStringify(account)
     ]);
   }
 
@@ -159,6 +196,8 @@ class PostgresClient {
     accounts: any[]
   ): Promise<void> {
     if (accounts.length === 0) return;
+
+    console.log(`[PostgresClient] Inserting ${accounts.length} ${source} accounts...`);
 
     const values: any[] = [];
     const placeholders: string[] = [];
@@ -171,18 +210,18 @@ class PostgresClient {
       
       values.push(
         source,
-        normalized.Name,
-        normalized.NormalizedName,
-        normalized.Phone,
-        normalized.NormalizedPhone,
-        normalized.Website,
-        normalized.NormalizedWebsite,
-        normalized.BillingStreet,
-        normalized.NormalizedBillingStreet,
-        normalized.BillingCity,
-        normalized.BillingPostalCode,
-        normalized.BillingCountry,
-        JSON.stringify(account)
+        sanitizeValue(normalized.Name),
+        sanitizeValue(normalized.NormalizedName),
+        sanitizeValue(normalized.Phone),
+        sanitizeValue(normalized.NormalizedPhone),
+        sanitizeValue(normalized.Website),
+        sanitizeValue(normalized.NormalizedWebsite),
+        sanitizeValue(normalized.BillingStreet),
+        sanitizeValue(normalized.NormalizedBillingStreet),
+        sanitizeValue(normalized.BillingCity),
+        sanitizeValue(normalized.BillingPostalCode),
+        sanitizeValue(normalized.BillingCountry),
+        safeJsonStringify(account) // Use safe stringify
       );
       
       paramIndex += 13;
@@ -200,6 +239,7 @@ class PostgresClient {
     `;
 
     await this.query(sql, values);
+    console.log(`[PostgresClient] Successfully inserted ${accounts.length} ${source} accounts`);
   }
 
   public async getAccountCounts(): Promise<{ source: number; dimensions: number; salesforce: number, total: number; }> {

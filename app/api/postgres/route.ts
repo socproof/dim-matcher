@@ -14,6 +14,27 @@ const pool = new Pool({
 const MAX_PARAMS_PER_QUERY = 60000;
 const PARAMS_PER_ROW = 13; // Based on your INSERT statement
 
+// Sanitize string by removing null bytes and other invalid UTF-8 sequences
+function sanitizeString(value: any): any {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  
+  if (typeof value === 'string') {
+    // Remove null bytes and other control characters except newlines and tabs
+    return value
+      .replace(/\u0000/g, '') // Remove null bytes
+      .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, ''); // Remove other control chars
+  }
+  
+  return value;
+}
+
+// Recursively sanitize all string values in params array
+function sanitizeParams(params: any[]): any[] {
+  return params.map(param => sanitizeString(param));
+}
+
 export async function POST(request: NextRequest) {
   try {
     const { sql, params } = await request.json();
@@ -42,8 +63,12 @@ export async function POST(request: NextRequest) {
         });
       }
 
-      if (params.length <= MAX_PARAMS_PER_QUERY) {
-        const result = await client.query(sql, params);
+      // Sanitize all params before processing
+      const sanitizedParams = sanitizeParams(params);
+      console.log('[Postgres] Sanitized params');
+
+      if (sanitizedParams.length <= MAX_PARAMS_PER_QUERY) {
+        const result = await client.query(sql, sanitizedParams);
         return NextResponse.json({
           rows: result.rows,
           rowCount: result.rowCount,
@@ -53,7 +78,7 @@ export async function POST(request: NextRequest) {
       // Need to split into batches
       console.log('[Postgres] Splitting into batches due to parameter limit');
 
-      const totalRows = params.length / PARAMS_PER_ROW;
+      const totalRows = sanitizedParams.length / PARAMS_PER_ROW;
       const maxRowsPerBatch = Math.floor(MAX_PARAMS_PER_QUERY / PARAMS_PER_ROW);
       const batches = Math.ceil(totalRows / maxRowsPerBatch);
 
@@ -70,7 +95,7 @@ export async function POST(request: NextRequest) {
         
         const startParam = startRow * PARAMS_PER_ROW;
         const endParam = endRow * PARAMS_PER_ROW;
-        const batchParams = params.slice(startParam, endParam);
+        const batchParams = sanitizedParams.slice(startParam, endParam);
 
         // Build VALUES clause for this batch
         const valueClauses: string[] = [];
@@ -95,8 +120,24 @@ export async function POST(request: NextRequest) {
 
         console.log(`[Postgres] Batch ${i + 1}/${batches}: rows ${startRow}-${endRow}, params ${batchParams.length}`);
         
-        const result = await client.query(batchSql, batchParams);
-        totalInserted += result.rowCount || 0;
+        try {
+          const result = await client.query(batchSql, batchParams);
+          totalInserted += result.rowCount || 0;
+        } catch (batchError) {
+          console.error(`[Postgres] Batch ${i + 1} error:`, batchError);
+          
+          // Log problematic params for debugging
+          console.error('[Postgres] Problematic batch params sample:', 
+            batchParams.slice(0, 20).map((p, idx) => ({
+              index: idx,
+              value: p,
+              type: typeof p,
+              hasNullByte: typeof p === 'string' && p.includes('\u0000')
+            }))
+          );
+          
+          throw batchError;
+        }
       }
 
       console.log(`[Postgres] Total inserted: ${totalInserted} rows`);
@@ -116,7 +157,10 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(
       { 
         error: 'Database query failed',
-        details: error instanceof Error ? error.message : 'Unknown error'
+        details: error instanceof Error ? error.message : 'Unknown error',
+        code: (error as any)?.code,
+        position: (error as any)?.position,
+        where: (error as any)?.where
       },
       { status: 500 }
     );

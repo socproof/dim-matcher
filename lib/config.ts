@@ -2,9 +2,9 @@
 
 // Development limits (set to 0 for no limit in production)
 export const DEV_LIMITS = {
-  source: 1000,       // Source accounts to load
-  dimensions: 10000,  // Dimensions accounts to load
-  salesforce: 10000,  // Salesforce accounts to load
+  source: 0,       // Source accounts to load
+  dimensions: 0,  // Dimensions accounts to load
+  salesforce: 0,  // Salesforce accounts to load
 };
 
 // Processing settings
