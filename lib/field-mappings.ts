@@ -8,7 +8,8 @@ export const DIMENSIONS_FIELD_MAPPING = {
   'cupostcode': 'BillingPostalCode',
   'cu_country': 'BillingCountry',
   'cu_address_user1': 'BillingCity',
-  'cuphone': 'Phone'
+  'cuphone': 'Phone',
+  'cu_email': 'Email'
 } as const;
 
 // Source table fields (already in Salesforce format)

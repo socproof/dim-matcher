@@ -1,407 +1,438 @@
-// lib/postgres-client.ts
+import { 
+  normalizeCompanyName, 
+  normalizePhone, 
+  normalizeWebsite, 
+  normalizeAddress,
+  extractEmailDomain 
+} from './normalize';
 
-import { normalizeCompanyName, normalizePhone, normalizeWebsite, normalizeAddress } from './normalize';
-
-export type AccountDBRow = {
-    id: number;
-    source: 'source' | 'dimensions' | 'salesforce';
-    name: string | null;
-    normalized_name: string | null;
-    phone: string | null;
-    normalized_phone: string | null;
-    website: string | null;
-    normalized_website: string | null;
-    billing_street: string | null;
-    normalized_billing_street: string | null;
-    billing_city: string | null;
-    billing_postal_code: string | null;
-    billing_country: string | null;
-    raw_data: any;
-    created_at: string;
-};
-
-
-function sanitizeString(value: any): string | null {
-    if (value === null || value === undefined) {
-        return null;
-    }
-
-    const str = String(value);
-
-    return str
-        .replace(/\u0000/g, '') // null byte
-        .replace(/\\/g, '\\\\') // экранируем обратные слэши
-        .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '') // удаляем control characters
-        .trim();
+export interface AccountDBRow {
+  id: number;
+  source: string;
+  name: string | null;
+  normalized_name: string | null;
+  phone: string | null;
+  normalized_phone: string | null;
+  website: string | null;
+  normalized_website: string | null;
+  billing_street: string | null;
+  normalized_billing_street: string | null;
+  billing_city: string | null;
+  billing_postal_code: string | null;
+  billing_country: string | null;
+  raw_data: any;
+  created_at: string;
 }
 
-
-function sanitizeObject(obj: any): any {
-    if (obj === null || obj === undefined) {
-        return null;
-    }
-
-    if (typeof obj === 'string') {
-        return sanitizeString(obj);
-    }
-
-    if (typeof obj === 'number' || typeof obj === 'boolean') {
-        return obj;
-    }
-
-    if (Array.isArray(obj)) {
-        return obj.map(item => sanitizeObject(item));
-    }
-
-    if (typeof obj === 'object') {
-        const cleaned: any = {};
-        for (const key in obj) {
-            if (obj.hasOwnProperty(key)) {
-                cleaned[key] = sanitizeObject(obj[key]);
-            }
-        }
-        return cleaned;
-    }
-
-    return obj;
+interface NormalizedAccount {
+  Name: string;
+  NormalizedName: string;
+  Phone: string;
+  NormalizedPhone: string;
+  Website: string;
+  NormalizedWebsite: string;
+  BillingStreet: string;
+  NormalizedBillingStreet: string;
+  BillingCity: string;
+  BillingPostalCode: string;
+  BillingCountry: string;
 }
 
-
-function mapAccountFields(account: any, fieldMapping: Record<string, string> | null | undefined): any {
-
-    // If no mapping provided, return account as-is
-    if (!fieldMapping || typeof fieldMapping !== 'object') {
-        return account;
-    }
-
-    const entries = Object.entries(fieldMapping);
-
-    // If mapping is empty, return account as-is
-    if (entries.length === 0) {
-        return account;
-    }
-
-    const mapped: any = {};
-
-    for (const [sourceField, targetField] of entries) {
-        if (account[sourceField] !== undefined) {
-            mapped[targetField] = account[sourceField];
-        }
-    }
-
-    // Also copy any fields that are already in standard format
-    const standardFields = ['Name', 'Phone', 'Website', 'BillingStreet', 'BillingCity', 'BillingPostalCode', 'BillingCountry', 'AccountNumber'];
-    for (const field of standardFields) {
-        if (account[field] !== undefined && mapped[field] === undefined) {
-            mapped[field] = account[field];
-        }
-    }
-
-    return mapped;
+interface QueryResult<T> {
+  rows: T[];
+  rowCount: number;
 }
 
-export class PostgresClient {
-    private apiUrl: string = '/api/postgres';
+class PostgresClient {
+  private baseUrl: string;
 
-    constructor() { }
+  constructor() {
+    this.baseUrl = '/api/postgres';
+  }
 
-    public async testConnection(): Promise<{ connected: boolean; error?: string; details?: any }> {
-        try {
-            const response = await fetch('/api/postgres', {
-                method: 'GET',
-            });
+  private async query<T = QueryResult<any>>(sql: string, params: any[] = []): Promise<T> {
+    const response = await fetch(this.baseUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sql, params }),
+    });
 
-            if (!response.ok) {
-                const error = await response.json();
-                return {
-                    connected: false,
-                    error: error.error || 'Connection failed',
-                    details: error
-                };
-            }
-
-            const data = await response.json();
-            console.log('[PostgresClient] Connection test:', data);
-
-            return {
-                connected: data.status === 'connected',
-                details: data
-            };
-        } catch (error) {
-            return {
-                connected: false,
-                error: error instanceof Error ? error.message : 'Unknown error'
-            };
-        }
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Database query failed');
     }
 
-    private async query<T = any>(sql: string, params: any[] = []): Promise<T> {
-        const response = await fetch(this.apiUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sql, params }),
-        });
+    return response.json();
+  }
 
-        if (!response.ok) {
-            const error = await response.json();
-            console.error('[PostgresClient] Query failed:', error);
-            throw new Error(error.details || error.error || 'Database query failed');
-        }
+  private normalizeAccount(account: any): NormalizedAccount {
+    const name = account.Name || account.name || account.cuname || '';
+    const phone = account.Phone || account.phone || account.cuphone || '';
+    const website = account.Website || account.website || '';
+    const email = account.Email || account.email || account.cu_email || '';
+    const billingStreet = account.BillingStreet || account.billing_street || account.cuaddress || '';
+    const billingCity = account.BillingCity || account.billing_city || account.cu_address_user1 || '';
+    const billingPostalCode = account.BillingPostalCode || account.billing_postal_code || account.cupostcode || '';
+    const billingCountry = account.BillingCountry || account.billing_country || account.cu_country || '';
 
-        const result = await response.json();
-
-        return result;
+    // Normalize website, or extract domain from email if no website
+    let normalizedWebsite = '';
+    if (website) {
+      normalizedWebsite = normalizeWebsite(website);
+    } else if (email) {
+      // No website - try to get domain from email
+      const emailDomain = extractEmailDomain(email);
+      if (emailDomain) {
+        normalizedWebsite = emailDomain;
+      }
     }
 
-    public async insertAccountBatch(
-        accounts: any[],
-        source: 'source' | 'dimensions' | 'salesforce',
-        sourceFieldMapping: Record<string, string>
-    ) {
-        if (accounts.length === 0) {
-            console.log('[PostgresClient] No accounts to insert');
-            return;
-        }
+    return {
+      Name: name,
+      NormalizedName: normalizeCompanyName(name),
+      Phone: phone,
+      NormalizedPhone: normalizePhone(phone, billingCountry),
+      Website: website || email, // Store original website or email for reference
+      NormalizedWebsite: normalizedWebsite,
+      BillingStreet: billingStreet,
+      NormalizedBillingStreet: normalizeAddress(billingStreet),
+      BillingCity: billingCity,
+      BillingPostalCode: billingPostalCode,
+      BillingCountry: billingCountry,
+    };
+  }
 
-        console.log(`[PostgresClient] Inserting ${accounts.length} ${source} accounts...`);
+  public async checkConnection(): Promise<boolean> {
+    try {
+      const result = await this.query<{ rows: any[] }>('SELECT 1 as connected');
+      return result.rows?.[0]?.connected === 1;
+    } catch (error) {
+      console.error('[PostgresClient] Connection check failed:', error);
+      return false;
+    }
+  }
 
-        // Разбиваем на батчи по 500 записей для оптимизации
-        const batchSize = 500;
-        let totalInserted = 0;
+  public async clearAllAccounts(): Promise<void> {
+    await this.query('TRUNCATE TABLE accounts RESTART IDENTITY');
+  }
 
-        for (let i = 0; i < accounts.length; i += batchSize) {
-            const batch = accounts.slice(i, i + batchSize);
-            console.log(`[PostgresClient] Inserting batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(accounts.length / batchSize)} (${batch.length} records)...`);
+  public async clearAccountsBySource(source: 'source' | 'dimensions' | 'salesforce'): Promise<void> {
+    await this.query('DELETE FROM accounts WHERE source = $1', [source]);
+  }
 
-            try {
-                await this.insertBatch(batch, source, sourceFieldMapping);
-                totalInserted += batch.length;
-                console.log(`[PostgresClient] Progress: ${totalInserted}/${accounts.length}`);
-            } catch (error) {
-                console.error(`[PostgresClient] Failed to insert batch at offset ${i}:`, error);
-                // Пробуем вставить по одной записи из проблемного батча
-                console.log(`[PostgresClient] Attempting individual inserts for failed batch...`);
-                for (let j = 0; j < batch.length; j++) {
-                    try {
-                        await this.insertBatch([batch[j]], source, sourceFieldMapping);
-                        totalInserted++;
-                    } catch (singleError) {
-                        console.error(`[PostgresClient] Failed to insert single record at index ${i + j}:`, singleError);
-                        console.error(`[PostgresClient] Problematic record:`, batch[j]);
-                    }
-                }
-            }
-        }
+  public async insertAccount(
+    source: 'source' | 'dimensions' | 'salesforce',
+    account: any
+  ): Promise<void> {
+    const normalized = this.normalizeAccount(account);
 
-        console.log(`[PostgresClient] Successfully inserted ${totalInserted}/${accounts.length} ${source} accounts`);
+    const sql = `
+      INSERT INTO accounts (
+        source, name, normalized_name, 
+        phone, normalized_phone,
+        website, normalized_website,
+        billing_street, normalized_billing_street,
+        billing_city, billing_postal_code, billing_country,
+        raw_data
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+    `;
+
+    await this.query(sql, [
+      source,
+      normalized.Name,
+      normalized.NormalizedName,
+      normalized.Phone,
+      normalized.NormalizedPhone,
+      normalized.Website,
+      normalized.NormalizedWebsite,
+      normalized.BillingStreet,
+      normalized.NormalizedBillingStreet,
+      normalized.BillingCity,
+      normalized.BillingPostalCode,
+      normalized.BillingCountry,
+      JSON.stringify(account)
+    ]);
+  }
+
+  public async insertAccountsBatch(
+    source: 'source' | 'dimensions' | 'salesforce',
+    accounts: any[]
+  ): Promise<void> {
+    if (accounts.length === 0) return;
+
+    const values: any[] = [];
+    const placeholders: string[] = [];
+    let paramIndex = 1;
+
+    for (const account of accounts) {
+      const normalized = this.normalizeAccount(account);
+      
+      placeholders.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7}, $${paramIndex + 8}, $${paramIndex + 9}, $${paramIndex + 10}, $${paramIndex + 11}, $${paramIndex + 12})`);
+      
+      values.push(
+        source,
+        normalized.Name,
+        normalized.NormalizedName,
+        normalized.Phone,
+        normalized.NormalizedPhone,
+        normalized.Website,
+        normalized.NormalizedWebsite,
+        normalized.BillingStreet,
+        normalized.NormalizedBillingStreet,
+        normalized.BillingCity,
+        normalized.BillingPostalCode,
+        normalized.BillingCountry,
+        JSON.stringify(account)
+      );
+      
+      paramIndex += 13;
     }
 
-    private async insertBatch(
-        accounts: any[],
-        source: 'source' | 'dimensions' | 'salesforce',
-        sourceFieldMapping: Record<string, string>
-    ) {
-        if (accounts.length === 0) return;
+    const sql = `
+      INSERT INTO accounts (
+        source, name, normalized_name,
+        phone, normalized_phone,
+        website, normalized_website,
+        billing_street, normalized_billing_street,
+        billing_city, billing_postal_code, billing_country,
+        raw_data
+      ) VALUES ${placeholders.join(', ')}
+    `;
 
-        const values: string[] = [];
-        const params: any[] = [];
-        let paramIndex = 1;
+    await this.query(sql, values);
+  }
 
-        for (const account of accounts) {
-            const sanitizedAccount = sanitizeObject(account);
-            const mappedAccount = mapAccountFields(sanitizedAccount, sourceFieldMapping);
-            const normalized = this.normalizeAccount(mappedAccount);
+  public async getAccountCounts(): Promise<{ source: number; dimensions: number; salesforce: number, total: number; }> {
+    const result = await this.query<{ rows: { source: string; count: string }[] }>(`
+      SELECT source, COUNT(*) as count 
+      FROM accounts 
+      GROUP BY source
+    `);
 
-            values.push(
-                `($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6}, $${paramIndex + 7}, $${paramIndex + 8}, $${paramIndex + 9}, $${paramIndex + 10}, $${paramIndex + 11}, $${paramIndex + 12})`
-            );
+    const counts = { source: 0, dimensions: 0, salesforce: 0, total: 0 };
+    for (const row of result.rows || []) {
+      if (row.source in counts) {
+        counts[row.source as keyof typeof counts] = parseInt(row.count);
+      }
+    }
 
-            params.push(
-                source,
-                mappedAccount.Name || null,
-                normalized.Name,
-                mappedAccount.Phone || null,
-                normalized.Phone,
-                mappedAccount.Website || null,
-                normalized.Website,
-                mappedAccount.BillingStreet || null,
-                normalized.BillingStreet,
-                mappedAccount.BillingCity || null,
-                mappedAccount.BillingPostalCode || null,
-                mappedAccount.BillingCountry || null,
-                JSON.stringify(sanitizedAccount)
-            );
+     counts.total = counts.source + counts.dimensions + counts.salesforce;
 
-            paramIndex += 13;
-        }
+    return counts;
+  }
 
-        const sql = `
-    INSERT INTO accounts (
-      source, name, normalized_name,
-      phone, normalized_phone,
+  public async getTotalSourceCount(): Promise<number> {
+    const result = await this.query<{ rows: { count: string }[] }>(`
+      SELECT COUNT(*) as count FROM accounts WHERE source = 'source'
+    `);
+    return parseInt(result.rows?.[0]?.count || '0');
+  }
+
+  public async getSourceAccountsChunk(limit: number, offset: number): Promise<AccountDBRow[]> {
+    const result = await this.query<{ rows: AccountDBRow[] }>(`
+      SELECT * FROM accounts 
+      WHERE source = 'source' 
+      ORDER BY id 
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
+    return result.rows || [];
+  }
+
+  public async findPotentialMatches(
+    account: any,
+    targetSource: 'dimensions' | 'salesforce' = 'salesforce',
+    limit: number = 50
+  ): Promise<AccountDBRow[]> {
+    const normalized = this.normalizeAccount(account);
+
+    const hasName = normalized.NormalizedName && normalized.NormalizedName.length > 2;
+    const hasPhone = normalized.NormalizedPhone && normalized.NormalizedPhone.length > 5;
+    const hasWebsite = normalized.NormalizedWebsite && normalized.NormalizedWebsite.length > 3;
+
+    if (!hasName && !hasPhone && !hasWebsite) {
+      return [];
+    }
+
+    const unionParts: string[] = [];
+    const params: any[] = [];
+    let paramIdx = 1;
+
+    const selectFields = `
+      id, source, name, normalized_name, phone, normalized_phone,
       website, normalized_website,
       billing_street, normalized_billing_street,
-      billing_city, billing_postal_code, billing_country,
-      raw_data
-    ) VALUES ${values.join(', ')}
-  `;
-
-        const result = await this.query(sql, params);
-        console.log(`[PostgresClient] Batch insert completed: ${result.rowCount} rows`);
-    }
-
-    private normalizeAccount(account: any) {
-        // Просто берем поля напрямую, без маппинга
-        return {
-            Name: normalizeCompanyName(account.Name || ''),
-            Phone: normalizePhone(account.Phone || ''),
-            Website: normalizeWebsite(account.Website || ''),
-            BillingStreet: normalizeAddress(account.BillingStreet || '')
-        };
-    }
-
-    public async findPotentialMatches(
-        account: any,
-        targetSource: 'dimensions' | 'salesforce' = 'salesforce',
-        limit: number = 100
-    ): Promise<AccountDBRow[]> {
-        const normalizedInputAccount = this.normalizeAccount(account);
-
-        console.log('[findPotentialMatches] Input account:', account);
-        console.log('[findPotentialMatches] Normalized:', normalizedInputAccount);
-        console.log('[findPotentialMatches] Target source:', targetSource);
-
-        const conditions: string[] = [];
-        const params: any[] = [targetSource];
-        let paramIndex = 2;
-
-        // Поиск по имени (триграмное сходство)
-        if (normalizedInputAccount.Name && normalizedInputAccount.Name.length > 0) {
-            conditions.push(`normalized_name % $${paramIndex}`);
-            params.push(normalizedInputAccount.Name);
-            console.log(`[findPotentialMatches] Added Name condition: ${normalizedInputAccount.Name}`);
-            paramIndex++;
-        }
-
-        // Поиск по телефону
-        if (normalizedInputAccount.Phone && normalizedInputAccount.Phone.length > 0) {
-            conditions.push(`normalized_phone = $${paramIndex}`);
-            params.push(normalizedInputAccount.Phone);
-            console.log(`[findPotentialMatches] Added Phone condition: ${normalizedInputAccount.Phone}`);
-            paramIndex++;
-        }
-
-        // Поиск по вебсайту
-        if (normalizedInputAccount.Website && normalizedInputAccount.Website.length > 0) {
-            conditions.push(`normalized_website = $${paramIndex}`);
-            params.push(normalizedInputAccount.Website);
-            console.log(`[findPotentialMatches] Added Website condition: ${normalizedInputAccount.Website}`);
-            paramIndex++;
-        }
-
-        // Поиск по адресу
-        if (normalizedInputAccount.BillingStreet && normalizedInputAccount.BillingStreet.length > 0) {
-            conditions.push(`normalized_billing_street = $${paramIndex}`);
-            params.push(normalizedInputAccount.BillingStreet);
-            console.log(`[findPotentialMatches] Added BillingStreet condition: ${normalizedInputAccount.BillingStreet}`);
-            paramIndex++;
-        }
-
-        if (conditions.length === 0) {
-            console.log('[findPotentialMatches] No conditions - returning empty array');
-            return [];
-        }
-
-        const sql = `
-    SELECT * FROM accounts
-    WHERE source = $1
-    AND (${conditions.join(' OR ')})
-    LIMIT ${limit}
-  `;
-
-        console.log('[findPotentialMatches] SQL:', sql);
-        console.log('[findPotentialMatches] Params:', params);
-
-        const result = await this.query<{ rows: AccountDBRow[] }>(sql, params);
-
-        console.log('[findPotentialMatches] Found matches:', result.rows?.length || 0);
-
-        if (result.rows && result.rows.length > 0) {
-            console.log('[findPotentialMatches] First match:', result.rows[0]);
-        }
-
-        return result.rows || [];
-    }
-
-    public async getAccountCounts(): Promise<{
-        source: number;
-        dimensions: number;
-        salesforce: number;
-        total: number
-    }> {
-        const sql = `
-      SELECT 
-        source,
-        COUNT(*) as count
-      FROM accounts
-      GROUP BY source
+      billing_city, billing_postal_code, billing_country, 
+      raw_data, created_at
     `;
 
-        const result = await this.query<{ rows: { source: string; count: string }[] }>(sql);
-        const rows = result.rows || [];
-
-        console.log('[PostgresClient] Account counts raw:', rows);
-
-        const source = parseInt(rows.find(r => r.source === 'source')?.count || '0');
-        const dimensions = parseInt(rows.find(r => r.source === 'dimensions')?.count || '0');
-        const salesforce = parseInt(rows.find(r => r.source === 'salesforce')?.count || '0');
-
-        return {
-            source,
-            dimensions,
-            salesforce,
-            total: source + dimensions + salesforce
-        };
+    // Priority 1: Exact phone match (most reliable)
+    if (hasPhone) {
+      unionParts.push(`
+        (SELECT ${selectFields}, 100 as priority
+         FROM accounts 
+         WHERE source = $${paramIdx} AND normalized_phone = $${paramIdx + 1}
+         LIMIT 5)
+      `);
+      params.push(targetSource, normalized.NormalizedPhone);
+      paramIdx += 2;
     }
 
-    public async clearAccounts(source?: 'source' | 'dimensions' | 'salesforce'): Promise<void> {
-        let sql = "DELETE FROM accounts";
-        const params: string[] = [];
-
-        if (source) {
-            sql += " WHERE source = $1";
-            params.push(source);
-        }
-
-        console.log(`[PostgresClient] Clearing accounts${source ? ` for source: ${source}` : ' (ALL)'}`);
-        const result = await this.query(sql, params);
-        console.log(`[PostgresClient] Cleared ${result.rowCount} accounts`);
+    // Priority 2: Website/domain match (includes email domain!)
+    if (hasWebsite) {
+      unionParts.push(`
+        (SELECT ${selectFields}, 95 as priority
+         FROM accounts 
+         WHERE source = $${paramIdx} AND normalized_website = $${paramIdx + 1}
+         LIMIT 5)
+      `);
+      params.push(targetSource, normalized.NormalizedWebsite);
+      paramIdx += 2;
     }
 
-    public async getSourceAccountsChunk(limit: number, offset: number): Promise<AccountDBRow[]> {
-        const sql = `
-      SELECT * FROM accounts
-      WHERE source = 'source'
-      ORDER BY id
-      LIMIT $1 OFFSET $2
+    // Priority 3: Name similarity (uses GIN trigram index)
+    if (hasName) {
+      unionParts.push(`
+        (SELECT ${selectFields}, (similarity(normalized_name, $${paramIdx + 1}) * 80)::int as priority
+         FROM accounts 
+         WHERE source = $${paramIdx} 
+           AND normalized_name % $${paramIdx + 1}
+         ORDER BY normalized_name <-> $${paramIdx + 1}
+         LIMIT 20)
+      `);
+      params.push(targetSource, normalized.NormalizedName);
+      paramIdx += 2;
+    }
+
+    if (unionParts.length === 0) {
+      return [];
+    }
+
+    const sql = `
+      WITH candidates AS (
+        ${unionParts.join(' UNION ALL ')}
+      )
+      SELECT DISTINCT ON (id) 
+             id, source, name, normalized_name, phone, normalized_phone,
+             website, normalized_website,
+             billing_street, normalized_billing_street,
+             billing_city, billing_postal_code, billing_country,
+             raw_data, created_at
+      FROM candidates
+      ORDER BY id, priority DESC
+      LIMIT ${limit}
     `;
 
-        const result = await this.query<{ rows: AccountDBRow[] }>(sql, [limit, offset]);
-        return result.rows || [];
+    try {
+      const result = await this.query<{ rows: AccountDBRow[] }>(sql, params);
+      return result.rows || [];
+    } catch (error) {
+      console.error('[findPotentialMatches] Error:', error);
+      return [];
+    }
+  }
+
+  public async findPotentialMatchesBatch(
+    sourceAccounts: { id: number; account: any }[],
+    targetSource: 'dimensions' | 'salesforce',
+    limitPerAccount: number = 30
+  ): Promise<Map<number, AccountDBRow[]>> {
+    const results = new Map<number, AccountDBRow[]>();
+    
+    if (sourceAccounts.length === 0) return results;
+
+    const searchTerms: {
+      id: number;
+      name: string | null;
+      phone: string | null;
+      website: string | null;
+    }[] = [];
+    
+    for (const { id, account } of sourceAccounts) {
+      const normalized = this.normalizeAccount(account);
+      searchTerms.push({
+        id,
+        name: normalized.NormalizedName && normalized.NormalizedName.length > 2 
+          ? normalized.NormalizedName : null,
+        phone: normalized.NormalizedPhone && normalized.NormalizedPhone.length > 5 
+          ? normalized.NormalizedPhone : null,
+        website: normalized.NormalizedWebsite && normalized.NormalizedWebsite.length > 3 
+          ? normalized.NormalizedWebsite : null
+      });
     }
 
-    public async getTotalSourceCount(): Promise<number> {
-        const sql = "SELECT COUNT(*) as count FROM accounts WHERE source = 'source'";
-        const result = await this.query<{ rows: { count: string }[] }>(sql);
-        return parseInt(result.rows?.[0]?.count || '0');
+    const sql = `
+      WITH search_terms AS (
+        SELECT * FROM jsonb_to_recordset($1::jsonb) 
+        AS t(id int, name text, phone text, website text)
+      ),
+      phone_matches AS (
+        SELECT st.id as source_id, a.*, 100 as priority
+        FROM search_terms st
+        JOIN accounts a ON a.source = $2 AND a.normalized_phone = st.phone
+        WHERE st.phone IS NOT NULL
+      ),
+      website_matches AS (
+        SELECT st.id as source_id, a.*, 95 as priority
+        FROM search_terms st
+        JOIN accounts a ON a.source = $2 AND a.normalized_website = st.website
+        WHERE st.website IS NOT NULL
+      ),
+      name_matches AS (
+        SELECT st.id as source_id, a.*, 
+               (similarity(a.normalized_name, st.name) * 80)::int as priority
+        FROM search_terms st
+        JOIN LATERAL (
+          SELECT * FROM accounts 
+          WHERE source = $2 
+            AND normalized_name % st.name
+          ORDER BY normalized_name <-> st.name
+          LIMIT ${limitPerAccount}
+        ) a ON true
+        WHERE st.name IS NOT NULL
+      ),
+      all_matches AS (
+        SELECT * FROM phone_matches
+        UNION ALL SELECT * FROM website_matches
+        UNION ALL SELECT * FROM name_matches
+      )
+      SELECT DISTINCT ON (source_id, id) 
+             source_id,
+             id, source, name, normalized_name, phone, normalized_phone,
+             website, normalized_website,
+             billing_street, normalized_billing_street,
+             billing_city, billing_postal_code, billing_country, 
+             raw_data, created_at
+      FROM all_matches
+      ORDER BY source_id, id, priority DESC
+    `;
+
+    try {
+      const result = await this.query<{ rows: (AccountDBRow & { source_id: number })[] }>(
+        sql, 
+        [JSON.stringify(searchTerms), targetSource]
+      );
+
+      for (const row of (result.rows || [])) {
+        const sourceId = row.source_id;
+        if (!results.has(sourceId)) {
+          results.set(sourceId, []);
+        }
+        results.get(sourceId)!.push(row);
+      }
+
+      return results;
+    } catch (error) {
+      console.error('[findPotentialMatchesBatch] Error:', error);
+      return results;
     }
+  }
 }
 
-let postgresClientInstance: PostgresClient | undefined;
+let postgresClientInstance: PostgresClient | null = null;
 
 export const getPostgresClient = (): PostgresClient => {
-    if (!postgresClientInstance) {
-        postgresClientInstance = new PostgresClient();
-    }
-    return postgresClientInstance;
+  if (!postgresClientInstance) {
+    postgresClientInstance = new PostgresClient();
+  }
+  return postgresClientInstance;
 };

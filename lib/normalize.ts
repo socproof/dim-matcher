@@ -1,6 +1,5 @@
-// lib\normalize.ts
-
 import { compareTwoStrings } from 'string-similarity';
+import { GENERIC_EMAIL_DOMAINS } from './config';
 
 const COMPANY_SUFFIXES = [
   'ltd', 'limited', 'pty', 'pty ltd', 'pty limited',
@@ -9,11 +8,24 @@ const COMPANY_SUFFIXES = [
   'gmbh', 'ag', 'sarl', 'pte', 'lp', 'llp', 'co', 'company'
 ];
 
-const PHONE_PREFIXES = {
+const PHONE_PREFIXES: Record<string, { international: string; local: string; length: number }> = {
   'australia': { international: '61', local: '0', length: 9 },
   'new zealand': { international: '64', local: '0', length: 8 },
-  'united kingdom': { international: '44', local: '0', length: 10 }
+  'united kingdom': { international: '44', local: '0', length: 10 },
+  'uk': { international: '44', local: '0', length: 10 },
+  'england': { international: '44', local: '0', length: 10 },
+  'scotland': { international: '44', local: '0', length: 10 },
+  'wales': { international: '44', local: '0', length: 10 },
+  'northern ireland': { international: '44', local: '0', length: 10 },
+  'ireland': { international: '353', local: '0', length: 9 },
+  'united states': { international: '1', local: '1', length: 10 },
+  'usa': { international: '1', local: '1', length: 10 },
+  'germany': { international: '49', local: '0', length: 10 },
+  'france': { international: '33', local: '0', length: 9 },
 };
+
+// Default prefix for unknown countries
+const DEFAULT_PREFIXES = { international: '44', local: '0', length: 10 };
 
 const STREET_ABBREVIATIONS: Record<string, string> = {
   'st': 'street', 'rd': 'road', 'ave': 'avenue',
@@ -34,6 +46,8 @@ export const normalizeString = (str: string): string => {
 
 // Специализированная нормализация для названий компаний
 export const normalizeCompanyName = (name: string): string => {
+  if (!name) return '';
+  
   let normalized = normalizeString(name);
 
   COMPANY_SUFFIXES.forEach(suffix => {
@@ -46,6 +60,8 @@ export const normalizeCompanyName = (name: string): string => {
 
 // Нормализация адресов
 export const normalizeAddress = (address: string): string => {
+  if (!address) return '';
+  
   let normalized = normalizeString(address);
 
   Object.entries(STREET_ABBREVIATIONS).forEach(([abbr, full]) => {
@@ -56,31 +72,76 @@ export const normalizeAddress = (address: string): string => {
 };
 
 // Нормализация телефонов
-export const normalizePhone = (phone: string, country: string = 'australia'): string => {
-  const prefixes = typeof country === 'string' ? PHONE_PREFIXES[country.toLowerCase() as keyof typeof PHONE_PREFIXES] :
-    PHONE_PREFIXES.australia;
-
-  let digits = phone.replace(/\D/g, '');
-
-  if (digits.startsWith(prefixes.international)) {
-    digits = digits.slice(prefixes.international.length);
-  } else if (digits.startsWith(prefixes.local)) {
-    digits = digits.slice(prefixes.local.length);
+export const normalizePhone = (phone: string, country?: string): string => {
+  if (!phone) return '';
+  
+  // Find prefixes for the country, fallback to default
+  let prefixes = DEFAULT_PREFIXES;
+  
+  if (country) {
+    const countryLower = country.toLowerCase();
+    
+    // Try exact match first
+    if (PHONE_PREFIXES[countryLower]) {
+      prefixes = PHONE_PREFIXES[countryLower];
+    } else {
+      // Try partial match
+      for (const [key, value] of Object.entries(PHONE_PREFIXES)) {
+        if (countryLower.includes(key) || key.includes(countryLower)) {
+          prefixes = value;
+          break;
+        }
+      }
+    }
   }
 
+  let digits = phone.replace(/\D/g, '');
+  
+  if (!digits || digits.length < 5) return '';
+
+  // Remove international prefix if present
+  if (digits.startsWith(prefixes.international)) {
+    digits = digits.slice(prefixes.international.length);
+  } 
+  // Remove local prefix (usually 0) if present
+  else if (digits.startsWith(prefixes.local) && prefixes.local === '0') {
+    digits = digits.slice(1);
+  }
+
+  // Return last N digits based on country's expected length
   return digits.slice(-prefixes.length);
 };
 
 // Нормализация URL
 export const normalizeWebsite = (url: string): string => {
   if (!url) return '';
-  
+
   return url.toLowerCase()
     .replace(/^https?:\/\//, '')
-    .replace(/^http?:\/\//, '')
     .replace(/^www\./, '')
     .replace(/\/$/, '')
+    .split('/')[0]
     .split('?')[0];
+};
+
+// Извлечение домена из email
+export const extractEmailDomain = (email: string): string | null => {
+  if (!email) return null;
+
+  const cleaned = email.toLowerCase().trim();
+  const match = cleaned.match(/@([a-z0-9.-]+\.[a-z]{2,})$/i);
+
+  if (match) {
+    const domain = match[1];
+
+    if (GENERIC_EMAIL_DOMAINS.includes(domain)) {
+      return null;
+    }
+
+    return domain;
+  }
+
+  return null;
 };
 
 // Сравнение строк с учетом типа поля
@@ -102,8 +163,8 @@ export const compareFieldValues = (
     };
   }
 
-   // Специальная обработка вебсайтов
-   if (field === 'Website') {
+  // Специальная обработка вебсайтов
+  if (field === 'Website') {
     const norm1 = normalizeWebsite(value1);
     const norm2 = normalizeWebsite(value2);
     return {

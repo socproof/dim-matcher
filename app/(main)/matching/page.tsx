@@ -10,8 +10,10 @@ import { getPostgresClient } from '@/lib/postgres-client';
 import { processSourceChunk, MatchedAccount } from '@/lib/find-matches-chunked';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { InfoIcon } from 'lucide-react';
+import { Checkbox } from '@/components/ui/checkbox';
+import { PROCESSING, DEV_LIMITS, applyLimit, isDevMode } from '@/lib/config';
 
-const CHUNK_SIZE = 10;
+const CHUNK_SIZE = PROCESSING.chunkSize;
 
 export default function MatchingPage() {
   const [status, setStatus] = useState<string>('Checking database...');
@@ -38,6 +40,7 @@ export default function MatchingPage() {
   const [hasMoreChunks, setHasMoreChunks] = useState<boolean>(false);
   const [stats, setStats] = useState({ both: 0, dimOnly: 0, sfOnly: 0, new: 0 });
   const [dataLoaded, setDataLoaded] = useState(false);
+  const [enableAI, setEnableAI] = useState(true);
 
   const loadFieldMapping = useCallback(() => {
     const defaults = getDefaultMapping();
@@ -77,7 +80,8 @@ export default function MatchingPage() {
       'cupostcode': 'BillingPostalCode',
       'cu_country': 'BillingCountry',
       'cu_address_user1': 'BillingCity',
-      'cuphone': 'Phone'
+      'cuphone': 'Phone',
+      'cu_email': 'Email'
     },
     salesforce: {
       'AccountNumber': 'AccountNumber',
@@ -122,15 +126,18 @@ export default function MatchingPage() {
     checkDatabase();
   }, []);
 
-  // Загрузка данных из всех трех источников
   const handleLoadAccounts = async () => {
     if (!isDbReady) {
       setStatus('Database is not ready yet. Please wait or refresh.');
       return;
     }
 
+    const devModeWarning = isDevMode()
+      ? `\n\nDEV MODE: Limits active (Source: ${DEV_LIMITS.source}, Dim: ${DEV_LIMITS.dimensions}, SF: ${DEV_LIMITS.salesforce})`
+      : '';
+
     const confirmReload = confirm(
-      `This will delete all existing data (${dbCounts.total} records) and reload from Databricks. Continue?`
+      `This will delete all existing data (${dbCounts.total} records) and reload from Databricks. Continue?${devModeWarning}`
     );
 
     if (!confirmReload) {
@@ -147,64 +154,59 @@ export default function MatchingPage() {
 
     try {
       const client = getPostgresClient();
-      await client.clearAccounts();
+      await client.clearAllAccounts();
 
       const config = JSON.parse(localStorage.getItem('appConfig') || '{}');
       const fieldMapping = loadFieldMapping();
 
       console.log('[LoadAccounts] Config:', config);
-      console.log('[LoadAccounts] Field Mapping:', fieldMapping);
+      console.log('[LoadAccounts] Dev Limits:', DEV_LIMITS);
 
-      // Загружаем Source (маленькая таблица - можно за раз)
+      // Load Source
       setStatus('Loading Source accounts...');
       const sourceData = await loadTableData(
         config.apiUrl,
         config.accessToken,
         config.warehouseId,
         config.sourceTable,
-        20000
+        DEV_LIMITS.source || 20000  // Limit directly in query
       );
-
       console.log('[LoadAccounts] Source data loaded:', sourceData.length);
 
       setStatus(`Saving ${sourceData.length} Source accounts to database...`);
-      await client.insertAccountBatch(sourceData, 'source', fieldMapping.source);
+      await client.insertAccountsBatch('source', sourceData);
 
-      // Загружаем Dimensions чанками
-      setStatus('Loading Dimensions accounts (0/?)...');
+      // Load Dimensions
+      setStatus('Loading Dimensions accounts...');
       const dimensionsData = await loadTableInChunks(
         config.apiUrl,
         config.accessToken,
         config.warehouseId,
         config.dimensionsTable,
-        30000,
-        (loaded) => {
-          setStatus(`Loading Dimensions: ${loaded} records loaded...`);
-        }
+        5000,  // chunk size
+        (loaded) => setStatus(`Loading Dimensions: ${loaded} records loaded...`),
+        DEV_LIMITS.dimensions || undefined  // MAX RECORDS LIMIT
       );
-
       console.log('[LoadAccounts] Dimensions data loaded:', dimensionsData.length);
 
       setStatus(`Saving ${dimensionsData.length} Dimensions accounts to database...`);
-      await client.insertAccountBatch(dimensionsData, 'dimensions', fieldMapping.dimensions);
+      await client.insertAccountsBatch('dimensions', dimensionsData);
 
-      // Загружаем Salesforce чанками
-      setStatus('Loading Salesforce accounts (0/?)...');
+      // Load Salesforce
+      setStatus('Loading Salesforce accounts...');
       const salesforceData = await loadTableInChunks(
         config.apiUrl,
         config.accessToken,
         config.warehouseId,
         config.salesforceTable,
-        30000,
-        (loaded) => {
-          setStatus(`Loading Salesforce: ${loaded} records loaded...`);
-        }
+        5000,  // chunk size
+        (loaded) => setStatus(`Loading Salesforce: ${loaded} records loaded...`),
+        DEV_LIMITS.salesforce || undefined  // MAX RECORDS LIMIT
       );
-
       console.log('[LoadAccounts] Salesforce data loaded:', salesforceData.length);
 
       setStatus(`Saving ${salesforceData.length} Salesforce accounts to database...`);
-      await client.insertAccountBatch(salesforceData, 'salesforce', fieldMapping.salesforce);
+      await client.insertAccountsBatch('salesforce', salesforceData);
 
       const newCounts = {
         source: sourceData.length,
@@ -215,7 +217,9 @@ export default function MatchingPage() {
 
       setDbCounts(newCounts);
       setDataLoaded(true);
-      setStatus(`Successfully loaded ${newCounts.source} Source, ${newCounts.dimensions} Dimensions, and ${newCounts.salesforce} Salesforce accounts.`);
+
+      const devNote = isDevMode() ? ' (DEV MODE - limits active)' : '';
+      setStatus(`Successfully loaded ${newCounts.source} Source, ${newCounts.dimensions} Dimensions, and ${newCounts.salesforce} Salesforce accounts.${devNote}`);
       setHasMoreChunks(newCounts.source > 0);
 
     } catch (error) {
@@ -254,14 +258,14 @@ export default function MatchingPage() {
     return await response.json();
   };
 
-  // Вспомогательная функция для загрузки большой таблицы чанками
   const loadTableInChunks = async (
     apiUrl: string,
     accessToken: string,
     warehouseId: string,
     tablePath: string,
     chunkSize: number,
-    onProgress?: (loaded: number) => void
+    onProgress?: (loaded: number) => void,
+    maxRecords?: number  // NEW: maximum records to load
   ): Promise<any[]> => {
     const allData: any[] = [];
     let offset = 0;
@@ -270,7 +274,18 @@ export default function MatchingPage() {
 
     while (hasMore) {
       iteration++;
-      console.log(`[loadTableInChunks] ${tablePath} - Iteration ${iteration}, offset: ${offset}`);
+
+      // Check if we've reached the limit
+      if (maxRecords && allData.length >= maxRecords) {
+        console.log(`[loadTableInChunks] ${tablePath} - Reached limit of ${maxRecords} records, stopping`);
+        break;
+      }
+
+      // Calculate how many records we still need
+      const remainingNeeded = maxRecords ? maxRecords - allData.length : chunkSize;
+      const currentChunkSize = Math.min(chunkSize, remainingNeeded);
+
+      console.log(`[loadTableInChunks] ${tablePath} - Iteration ${iteration}, offset: ${offset}, requesting: ${currentChunkSize}`);
 
       try {
         const response = await fetch('/api/databricks/accounts', {
@@ -281,7 +296,7 @@ export default function MatchingPage() {
             accessToken,
             warehouseId,
             tablePath,
-            limit: chunkSize,
+            limit: currentChunkSize,
             offset
           }),
         });
@@ -292,7 +307,7 @@ export default function MatchingPage() {
 
           if (errorData.details?.message?.includes('Inline byte limit exceeded')) {
             console.log('[loadTableInChunks] Reducing chunk size due to byte limit');
-            return loadTableInChunks(apiUrl, accessToken, warehouseId, tablePath, Math.floor(chunkSize / 2), onProgress);
+            return loadTableInChunks(apiUrl, accessToken, warehouseId, tablePath, Math.floor(chunkSize / 2), onProgress, maxRecords);
           }
 
           break;
@@ -314,8 +329,15 @@ export default function MatchingPage() {
           onProgress(allData.length);
         }
 
-        if (chunkData.length < chunkSize) {
-          console.log(`[loadTableInChunks] ${tablePath} - Last chunk (${chunkData.length} < ${chunkSize}), stopping`);
+        // Check if we've reached the limit after adding data
+        if (maxRecords && allData.length >= maxRecords) {
+          console.log(`[loadTableInChunks] ${tablePath} - Reached limit of ${maxRecords} records`);
+          hasMore = false;
+          break;
+        }
+
+        if (chunkData.length < currentChunkSize) {
+          console.log(`[loadTableInChunks] ${tablePath} - Last chunk (${chunkData.length} < ${currentChunkSize}), stopping`);
           hasMore = false;
         } else {
           offset += chunkData.length;
@@ -328,11 +350,16 @@ export default function MatchingPage() {
       }
     }
 
-    console.log(`[loadTableInChunks] ${tablePath} - Completed. Total records: ${allData.length}`);
-    return allData;
+    // Trim to exact limit if we got more
+    const result = maxRecords && allData.length > maxRecords
+      ? allData.slice(0, maxRecords)
+      : allData;
+
+    console.log(`[loadTableInChunks] ${tablePath} - Completed. Total records: ${result.length}`);
+    return result;
   };
 
-  // Обработка чанка
+
   const handleProcessChunk = async (startIndex: number) => {
     if (!isDbReady) {
       setStatus('Database is not ready.');
@@ -351,9 +378,9 @@ export default function MatchingPage() {
     try {
       const fieldMapping = loadFieldMapping();
 
-      console.log('[ProcessChunk] Starting with mapping:', fieldMapping);
+      console.log('[ProcessChunk] Starting with AI:', enableAI);
 
-      const result = await processSourceChunk(fieldMapping, CHUNK_SIZE, startIndex);
+      const result = await processSourceChunk(fieldMapping, CHUNK_SIZE, startIndex, enableAI);
 
       console.log('[ProcessChunk] Result:', result);
 
@@ -378,6 +405,25 @@ export default function MatchingPage() {
     setShowDetails(true);
   };
 
+  const handleDiagnose = async () => {
+    setStatus('Running diagnostics...');
+    try {
+      const response = await fetch('/api/postgres/diagnose', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          testName: 'andrews',
+          testSource: 'salesforce'
+        }),
+      });
+      const data = await response.json();
+      console.log('[Diagnostics]', data);
+      setStatus(`Query time: ${data.queryTimeMs}ms, Found: ${data.resultsCount} results. Check console for details.`);
+    } catch (error) {
+      setStatus(`Diagnostics failed: ${error}`);
+    }
+  };
+
   const getStatusBadge = (status: string) => {
     switch (status) {
       case 'BOTH':
@@ -388,6 +434,12 @@ export default function MatchingPage() {
         return <Badge className="bg-purple-600">Salesforce Only</Badge>;
       case 'NEW':
         return <Badge variant="secondary">New</Badge>;
+      case 'CONFIRMED':
+        return <Badge className="bg-green-600">AI Confirmed</Badge>;
+      case 'REJECTED':
+        return <Badge className="bg-red-600">AI Rejected</Badge>;
+      case 'REVIEW':
+        return <Badge className="bg-yellow-600">Needs Review</Badge>;
       default:
         return <Badge variant="outline">{status}</Badge>;
     }
@@ -462,6 +514,27 @@ export default function MatchingPage() {
             Process Next Chunk
           </Button>
         )}
+
+        <Button
+          onClick={handleDiagnose}
+          variant="outline"
+          size="sm"
+          disabled={!isDbReady || isLoading || isProcessing}
+        >
+          Diagnose DB
+        </Button>
+
+        {/* AI Toggle */}
+        <div className="flex items-center gap-2 ml-4 border-l pl-4">
+          <Checkbox
+            id="enableAI"
+            checked={enableAI}
+            onCheckedChange={(checked) => setEnableAI(checked as boolean)}
+          />
+          <label htmlFor="enableAI" className="text-sm cursor-pointer">
+            Enable AI Validation
+          </label>
+        </div>
       </div>
 
       {currentChunkData.length > 0 && (
@@ -493,10 +566,18 @@ export default function MatchingPage() {
                     <TableCell>
                       {item.dimensionsMatch ? (
                         <div className="space-y-1">
-                          <p className="font-medium">{item.dimensionsMatch.cuname || item.dimensionsMatch.Name}</p>
-                          <Badge variant="outline" className="text-xs">
-                            Score: {item.dimensionsScore}
-                          </Badge>
+                          <p className="font-medium">{item.dimensionsMatch.Name}</p>
+                          <div className="flex gap-1 flex-wrap">
+                            <Badge variant="outline" className="text-xs">
+                              Score: {item.dimensionsScore}
+                            </Badge>
+                            {getStatusBadge(item.dimensionsStatus)}
+                          </div>
+                          {item.dimensionsAI && (
+                            <p className="text-xs text-muted-foreground">
+                              AI: {item.dimensionsAI.confidence}% - {item.dimensionsAI.reasoning}
+                            </p>
+                          )}
                         </div>
                       ) : (
                         <span className="text-muted-foreground italic text-sm">No match</span>
@@ -506,9 +587,17 @@ export default function MatchingPage() {
                       {item.salesforceMatch ? (
                         <div className="space-y-1">
                           <p className="font-medium">{item.salesforceMatch.Name}</p>
-                          <Badge variant="outline" className="text-xs">
-                            Score: {item.salesforceScore}
-                          </Badge>
+                          <div className="flex gap-1 flex-wrap">
+                            <Badge variant="outline" className="text-xs">
+                              Score: {item.salesforceScore}
+                            </Badge>
+                            {getStatusBadge(item.salesforceStatus)}
+                          </div>
+                          {item.salesforceAI && (
+                            <p className="text-xs text-muted-foreground">
+                              AI: {item.salesforceAI.confidence}% - {item.salesforceAI.reasoning}
+                            </p>
+                          )}
                         </div>
                       ) : (
                         <span className="text-muted-foreground italic text-sm">No match</span>
